@@ -37,6 +37,12 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # SwiGLU: replace ReLU² MLP activation with SwiGLU (Shazeer 2020)
+    swiglu: bool = False
+    # CLA: cross-layer attention KV sharing factor (Brandon et al. 2024)
+    # 1 = disabled (every layer computes its own KV)
+    # 2 = CLA-2 (even layers reuse KV from the preceding odd layer)
+    cla_sharing: int = 1
 
 
 def norm(x):
@@ -73,16 +79,25 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+
+        if shared_kv is not None:
+            # CLA: reuse K and V from the previous layer instead of computing new ones
+            k, v = shared_kv
+        else:
+            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+            # Store for potential CLA reuse by the next layer
+            self._cla_k = k
+            self._cla_v = v
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
+        # Note: applied after CLA reuse so even CLA layers get per-layer value specialization
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
@@ -121,12 +136,25 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.swiglu = config.swiglu
+        if config.swiglu:
+            # SwiGLU: two projections of size 8/3 * n_embd, rounded to nearest multiple of 64
+            # This keeps parameter count approximately equal to the ReLU² MLP (4 * n_embd)
+            # because 2 * (8/3) ≈ 4 * (2/2) in terms of total projection parameters
+            hidden = round(config.n_embd * 8 / 3 / 64) * 64
+            self.c_gate = nn.Linear(config.n_embd, hidden * 2, bias=False)  # projects to [gate | value]
+            self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
+        else:
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
+        if self.swiglu:
+            x, gate = self.c_gate(x).chunk(2, dim=-1)
+            x = x * F.silu(gate)
+        else:
+            x = self.c_fc(x)
+            x = F.relu(x).square()
         x = self.c_proj(x)
         return x
 
@@ -137,8 +165,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv)
         x = x + self.mlp(norm(x))
         return x
 
@@ -213,7 +241,10 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            if self.config.swiglu:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
@@ -400,10 +431,18 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
+        cla_sharing = self.config.cla_sharing
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
+            if cla_sharing > 1 and i % cla_sharing != 0:
+                # CLA: this layer reuses K and V cached by the previous group-leader layer
+                prev_block = self.transformer.h[i - 1]
+                shared_kv = (prev_block.attn._cla_k, prev_block.attn._cla_v)
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, shared_kv=shared_kv)
+            else:
+                # Normal layer: computes fresh K and V (stored in block.attn._cla_k/v for CLA)
+                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
