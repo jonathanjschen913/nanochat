@@ -2,56 +2,51 @@
 Part 2 Ablation Study — Picochat on Modal
 ==========================================
 
-Trains 4 picochat models and compares them:
-  - pico_baseline    : d=8, aspect-ratio=64, ReLU², standard MHA
-  - pico_swiglu      : d=8, aspect-ratio=64, SwiGLU only (Shazeer 2020)
-  - pico_cla         : d=8, aspect-ratio=64, ReLU², CLA-2 only (Brandon 2024)
-  - pico_swiglu_cla  : d=8, aspect-ratio=64, SwiGLU + CLA-2 combined
+Trains 4 picochat models at d=12 and compares them:
+  - pico_baseline       : standard MHA, per-layer KV
+  - pico_cla            : CLA-2 cross-layer KV sharing (Brandon et al., NeurIPS 2024)
+  - pico_diff_attn      : Differential Attention (Ye et al., ICLR 2025)
+  - pico_cla_diff_attn  : CLA-2 + Differential Attention combined
 
-The combined run tests whether the two changes compound positively, negatively,
-or independently — a key question for recommending them together in the full speedrun.
+The combined run tests whether CLA and Differential Attention interact positively,
+negatively, or independently when both are applied together.
 
 Usage
 -----
-Smoke test (local CPU/MPS, ~3 min):
+Smoke test (local CPU/MPS, ~5 min):
     bash runs/runpico_test.sh
 
-Full ablation on Modal (~20 min each, ~$28 total):
+Full ablation on Modal (~$82 total):
     modal run runs/pico_ablation_modal.py
 
 Individual stages:
     modal run runs/pico_ablation_modal.py::stage_data
     modal run runs/pico_ablation_modal.py::stage_tokenizer
     modal run runs/pico_ablation_modal.py::stage_pretrain_baseline
-    modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu
     modal run runs/pico_ablation_modal.py::stage_pretrain_cla
-    modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu_cla
+    modal run runs/pico_ablation_modal.py::stage_pretrain_diff_attn
+    modal run runs/pico_ablation_modal.py::stage_pretrain_cla_diff_attn
     modal run runs/pico_ablation_modal.py::stage_eval
 
-Cost reference (8×H100 at ~$31/hr for the node, eval on 4×H100 at ~$14/hr)
----------------------------------------------------------------------------
-    stage_data + tokenizer         :  ~10 min   ~$5.30
-    pico_baseline      d=12 8×H100 : ~5 min     ~$2.60
-    pico_cla           d=12 8×H100 : ~5 min     ~$2.60
-    stage_eval (bpb+CORE+sample)   : ~60 min    ~$4.70
-    Total                                       ~$15.20
-
-    (swiglu and swiglu_cla stages exist but are not run in the default
-     pipeline — call them individually if needed)
-
-Note: d=8 preliminary runs (val_bpb: baseline=1.027, cla=1.050; CORE:
-baseline=0.066, cla=0.057) showed CLA hurts at shallow depth. Switched
-to d=12 for more meaningful ablation.
+Cost reference (8×H100 at ~$28/hr, eval on 4×H100 at ~$14/hr)
+---------------------------------------------------------------
+    stage_data + tokenizer         : ~10 min    ~$5.30
+    pico_baseline      d=12 8×H100 : ~40 min    ~$18.70
+    pico_cla           d=12 8×H100 : ~40 min    ~$18.70
+    pico_diff_attn     d=12 8×H100 : ~40 min    ~$18.70
+    pico_cla_diff_attn d=12 8×H100 : ~40 min    ~$18.70
+    stage_eval (bpb+CORE, 4 models): ~120 min   ~$28.00
+    Total                                       ~$108
 
 Notes
 -----
-- Data and tokenizer stages are shared across all 4 runs (run once).
+- Data and tokenizer stages are shared across all runs (run once).
 - GPU config matches the reference speedrun (H100:8, device-batch-size=16).
-- 40 shards (~4GB) is sufficient for Chinchilla-optimal training at d=8.
-- W&B tracks all 4 runs under the same project for easy comparison.
-- CORE eval runs once per model after training (not during), to avoid
-  paying for 30-min evaluations at every checkpoint.
+- 80 shards (~8GB) provides comfortable headroom for Chinchilla-optimal d=12.
+- W&B tracks all runs under the same project for easy comparison.
+- CORE eval runs once per model after training (not during) to save cost.
 - The eval bundle (~1GB) is downloaded once and cached in the volume.
+- diff_attn models skip sample eval (KV cache not implemented for diff_attn).
 """
 
 import os
@@ -428,6 +423,85 @@ def stage_pretrain_cla_shared_ffn() -> None:
 
 
 # =============================================================================
+# STAGE 2f: PRETRAIN DIFFERENTIAL ATTENTION
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_TRAIN,
+    timeout=PRETRAIN_TIMEOUT_SEC,
+)
+def stage_pretrain_diff_attn() -> None:
+    """
+    pico_diff_attn: d=12, Differential Attention (Microsoft Research, ICLR 2025).
+    Two softmax maps whose difference cancels attention noise.
+    All other hyperparameters identical to baseline.
+    """
+    _setup_cache()
+    _torchrun(
+        "scripts.base_train",
+        [
+            "--depth=12",
+            "--aspect-ratio=64",
+            "--differential-attn",
+            f"--device-batch-size={DEVICE_BATCH_SIZE}",
+            "--head-dim=64",
+            "--window-pattern=L",
+            "--core-metric-every=-1",
+            "--sample-every=-1",
+            "--save-every=1000",
+            "--model-tag=pico_diff_attn",
+            f"--run={WANDB_PROJECT}_diff_attn",
+        ],
+        nproc=_N_TRAIN_GPUS,
+    )
+    volume.commit()
+    print("pico_diff_attn complete.")
+
+
+# =============================================================================
+# STAGE 2g: PRETRAIN CLA + DIFFERENTIAL ATTENTION (combined)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_TRAIN,
+    timeout=PRETRAIN_TIMEOUT_SEC,
+)
+def stage_pretrain_cla_diff_attn() -> None:
+    """
+    pico_cla_diff_attn: d=12, CLA-2 KV sharing + Differential Attention combined.
+    CLA follower layers reuse the leader's doubled k/v tensors for differential attention.
+    Tests whether the two changes interact positively, negatively, or independently.
+    """
+    _setup_cache()
+    _torchrun(
+        "scripts.base_train",
+        [
+            "--depth=12",
+            "--aspect-ratio=64",
+            "--cla-sharing=2",
+            "--differential-attn",
+            f"--device-batch-size={DEVICE_BATCH_SIZE}",
+            "--head-dim=64",
+            "--window-pattern=L",
+            "--core-metric-every=-1",
+            "--sample-every=-1",
+            "--save-every=1000",
+            "--model-tag=pico_cla_diff_attn",
+            f"--run={WANDB_PROJECT}_cla_diff_attn",
+        ],
+        nproc=_N_TRAIN_GPUS,
+    )
+    volume.commit()
+    print("pico_cla_diff_attn complete.")
+
+
+# =============================================================================
 # STAGE 3: EVAL ALL MODELS  (bpb + CORE + sample)
 # =============================================================================
 
@@ -440,11 +514,11 @@ def stage_pretrain_cla_shared_ffn() -> None:
 )
 def stage_eval() -> None:
     """
-    Run bpb + CORE + sample eval on all 4 models. Mirrors reference
+    Run bpb + CORE + sample eval on all 5 models. Mirrors reference
     stage_post_pretrain_eval but runs base_eval only (covers all three modes).
     CORE is the primary nanochat metric (DCLM benchmark, target 0.256525).
     Eval bundle (~1GB) is downloaded once and cached in the volume.
-    Each model takes ~30 min for CORE on 4×H100 (~2 hours total for 4 models).
+    Each model takes ~30 min for CORE on 4×H100 (~2.5 hours total for 5 models).
     """
     _setup_cache()
 
@@ -457,17 +531,24 @@ def stage_eval() -> None:
         _run(f"unzip -q {zip_path} -d {NANOCHAT_CACHE} && rm {zip_path}")
         volume.commit()
 
+    # diff_attn models skip sample eval: Engine uses KV cache which is not
+    # implemented for differential attention.
+    NO_SAMPLE_TAGS = {"pico_diff_attn", "pico_cla_diff_attn"}
+
+    MAIN_TAGS = ["pico_baseline", "pico_cla", "pico_diff_attn", "pico_cla_diff_attn"]
+
     results = {}
-    for tag in ["pico_baseline", "pico_cla", "pico_shared_ffn", "pico_cla_shared_ffn"]:
+    for tag in MAIN_TAGS:
         print(f"\n{'='*60}\nEvaluating {tag}...\n{'='*60}")
         log_path = os.path.join(NANOCHAT_CACHE, f"{tag}_eval.txt")
+        eval_modes = "core,bpb" if tag in NO_SAMPLE_TAGS else "core,bpb,sample"
 
         # Single torchrun call with tee to capture output
         _run(
             f"cd /root/nanochat && "
             f"uv run torchrun --standalone --nproc_per_node={_N_EVAL_GPUS} "
             f"-m scripts.base_eval -- "
-            f"--model-tag {tag} --eval core,bpb,sample "
+            f"--model-tag {tag} --eval {eval_modes} "
             f"--device-batch-size=1 --split-tokens=524288 --max-per-task=100 "
             f"2>&1 | tee {log_path}"
         )
@@ -504,42 +585,44 @@ def stage_eval() -> None:
 @app.local_entrypoint()
 def main() -> None:
     """
-    Full Part 2 ablation pipeline. Mirrors reference script stage structure.
+    Full Part 2 ablation pipeline — baseline, CLA, Differential Attention, combined.
 
-        0. Download 40 FineWeb-EDU shards       (CPU,    ~5 min,   ~$0.10)
-        1. Train BPE tokenizer                  (1xH100, ~2 min,   ~$0.12)
-        2a. Pretrain pico_baseline              (8xH100, ~10 min,  ~$5.20)
-        2b. Pretrain pico_cla                   (8xH100, ~10 min,  ~$5.20)
-        3. Eval all 4 (bpb + CORE + sample)     (4xH100, ~120 min, ~$9.30)
+        0. Download 80 FineWeb-EDU shards        (CPU,    ~10 min,  ~$0.10)
+        1. Train BPE tokenizer                   (1xH100, ~2 min,   ~$0.12)
+        2a. Pretrain pico_baseline               (8xH100, ~40 min,  ~$18.70)
+        2b. Pretrain pico_cla                    (8xH100, ~40 min,  ~$18.70)
+        2c. Pretrain pico_diff_attn              (8xH100, ~40 min,  ~$18.70)
+        2d. Pretrain pico_cla_diff_attn          (8xH100, ~40 min,  ~$18.70)
+        3.  Eval 4 models (bpb + CORE + sample)  (4xH100, ~120 min, ~$28.00)
 
-    Estimated total: ~$30-34 at H100 on-demand pricing (~$3.50/GPU/hr).
+    Estimated total: ~$103-108 at H100 on-demand pricing (~$3.50/GPU/hr).
     """
     w = 64
     print("\n" + "=" * w)
     print("Picochat Ablation Study — Part 2")
-    print(f"  Models : {list(CONFIGS.keys())}")
+    print(f"  Models : pico_baseline, pico_cla, pico_diff_attn, pico_cla_diff_attn")
     print(f"  GPU    : {GPU_TRAIN}  |  Shards: {NUM_SHARDS}  |  WandB: {WANDB_PROJECT}")
     print("=" * w + "\n")
 
-    print("[0/5] Downloading FineWeb-EDU shards...")
+    print("[0/6] Downloading FineWeb-EDU shards...")
     stage_data.remote(num_shards=NUM_SHARDS)
 
-    print("[1/5] Training tokenizer...")
+    print("[1/6] Training tokenizer...")
     stage_tokenizer.remote()
 
-    print("[2a/5] Training pico_baseline...")
+    print("[2a/6] Training pico_baseline...")
     stage_pretrain_baseline.remote()
 
-    print("[2b/5] Training pico_cla...")
+    print("[2b/6] Training pico_cla...")
     stage_pretrain_cla.remote()
 
-    print("[2c/5] Training pico_shared_ffn...")
-    stage_pretrain_shared_ffn.remote()
+    print("[2c/6] Training pico_diff_attn...")
+    stage_pretrain_diff_attn.remote()
 
-    print("[2d/5] Training pico_cla_shared_ffn (combined)...")
-    stage_pretrain_cla_shared_ffn.remote()
+    print("[2d/6] Training pico_cla_diff_attn (combined)...")
+    stage_pretrain_cla_diff_attn.remote()
 
-    print("[3/5] Evaluating all 4 models (bpb + CORE + sample)...")
+    print("[3/6] Evaluating 4 models (bpb + CORE)...")
     stage_eval.remote()
 
     print("\n" + "=" * w)

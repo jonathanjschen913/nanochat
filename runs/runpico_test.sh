@@ -66,5 +66,12 @@ python -m scripts.base_train \
     --model-tag="test_swiglu_cla"
 
 echo ""
-echo "==> All 4 smoke tests passed. Ready for cloud training."
+echo "==> [5/5] Smoke test: pico_diff_attn (Differential Attention)"
+python -m scripts.base_train \
+    $COMMON \
+    --differential-attn \
+    --model-tag="test_diff_attn"
+
+echo ""
+echo "==> All 5 smoke tests passed. Ready for cloud training."
 echo "    Next: modal run runs/pico_ablation_modal.py"
