@@ -47,9 +47,14 @@ The quality degradation at d=8 is consistent with CLA's theoretical motivation: 
 The control model. Matches the picochat configuration above with no modifications — identical to the Feb 2026 nanochat architecture at this scale. All other models are compared against this checkpoint.
 
 ### Model 2: pico_shared_ffn
-**Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **one MLP shared across all 12 layers**.
+**Config:** d=34, model_dim=768, 12 heads, ReLU² activation, **one MLP shared across all 34 layers**.
 
-Implements MobiLlama's (Thawakar et al., 2024) FFN weight sharing. Instead of 12 independent MLP instances, a single MLP is instantiated at the `GPT` level and passed to every block at forward time. This reduces MLP parameters by 11/12 ≈ 92% (from 12 MLPs to 1), with total model parameter savings of roughly 30% since MLPs are the dominant parameter contributor.
+Implements MobiLlama's (Thawakar et al., 2024) FFN weight sharing. Instead of per-layer MLPs, a single MLP is instantiated at the `GPT` level and reused by every block. The freed MLP parameters are reinvested in depth (d=34 vs d=12 baseline), making this an **iso-parameter** comparison:
+
+```
+baseline d=12:    12 × (2.36M attn + 4.72M MLP) = 84.9M params
+shared_ffn d=34:  34 × 2.36M attn  + 1 × 4.72M MLP = 85.0M params  ✓
+```
 
 ```python
 # In GPT.__init__:
@@ -60,7 +65,7 @@ for block in self.transformer.h:
     x = block(x, ..., mlp=self.shared_mlp)  # same weights every layer
 ```
 
-The freed parameters could in principle be reinvested in more depth, but in this ablation we hold depth constant to isolate the effect of sharing.
+This directly tests MobiLlama's core hypothesis: a single reusable MLP with more transformer depth outperforms many independent MLPs at the same parameter budget.
 
 ### Model 3: pico_cla
 **Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **CLA-2 KV sharing**.
@@ -83,7 +88,7 @@ for i, block in enumerate(self.transformer.h):
 All other hyperparameters are identical to the baseline. The change is isolated to `gpt.py`.
 
 ### Model 4: pico_cla_shared_ffn
-**Config:** d=12, model_dim=768, 12 heads, **CLA-2 KV sharing + shared FFN**.
+**Config:** d=34, model_dim=768, 12 heads, **CLA-2 KV sharing + shared FFN**.
 
 Both changes applied simultaneously. Determines whether the changes are independent, synergistic, or interfering. Since CLA operates on attention and shared FFN operates on the MLP, there is no direct architectural interaction — independence is the prior expectation.
 
@@ -117,10 +122,10 @@ modal run runs/pico_ablation_modal.py::stage_eval
 
 | Model | FFN | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ |
 |---|---|---|---|---|---|
-| pico_baseline | per-layer | None (MHA) | ~125M | **0.9250** | **0.1273** |
-| pico_shared_ffn | shared (1×) | None (MHA) | ~88M | **[TBD]** | **[TBD]** |
-| pico_cla | per-layer | CLA-2 | ~118M | **1.0505** | **0.0624** |
-| pico_cla_shared_ffn | shared (1×) | CLA-2 | ~81M | **[TBD]** | **[TBD]** |
+| pico_baseline (d=12) | per-layer | None (MHA) | ~85M | **0.9250** | **0.1273** |
+| pico_cla (d=12) | per-layer | CLA-2 | ~78M | **1.0505** | **0.0624** |
+| pico_shared_ffn (d=34) | shared (1×) | None (MHA) | ~85M | **[TBD]** | **[TBD]** |
+| pico_cla_shared_ffn (d=34) | shared (1×) | CLA-2 | ~85M | **[TBD]** | **[TBD]** |
 | GPT-2 target | — | — | ~1.5B | ~0.748 | 0.2565 |
 
 **Note on CORE scores:** At picochat scale (d=12, ~125M params), CORE scores are well below the GPT-2 threshold of 0.256525. The relative difference between models is what matters — a 51% drop in CORE from baseline to CLA is a strong and consistent signal.

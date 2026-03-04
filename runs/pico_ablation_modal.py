@@ -70,8 +70,10 @@ from modal import App, Image as ModalImage, Volume, Secret
 CONFIGS = {
     "pico_baseline":        {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": False},
     "pico_cla":             {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": False},
-    "pico_shared_ffn":      {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
-    "pico_cla_shared_ffn":  {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": True},
+    "pico_shared_ffn":      {"depth": 34, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
+    "pico_cla_shared_ffn":  {"depth": 34, "aspect_ratio": 64, "cla": True,  "shared_ffn": True},
+    # Note: shared_ffn runs use d=24 to reinvest freed MLP params into depth,
+    # matching MobiLlama's design principle. d=12 baseline is the control.
 }
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
@@ -435,18 +437,20 @@ def stage_pretrain_swiglu_cla() -> None:
 )
 def stage_pretrain_shared_ffn() -> None:
     """
-    pico_shared_ffn: d=12, one MLP shared across all transformer layers.
+    pico_shared_ffn: d=34, one MLP shared across all transformer layers.
     Implements MobiLlama (2024) FFN weight sharing.
-    Reduces MLP parameters by (n_layer - 1) / n_layer = 11/12 ≈ 92%.
-    All other hyperparameters identical to baseline.
+    d=34 is iso-parameter to the d=12 baseline (~85M transformer matrix params):
+      baseline d=12: 12 × (attn 2.36M + MLP 4.72M) = 84.9M
+      shared_ffn d=34: 34 × attn 2.36M + 1 × MLP 4.72M = 85.0M
+    This makes the comparison fair — same parameter budget, different allocation.
     """
     _setup_cache()
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=12",
+            "--depth=34",
             "--aspect-ratio=64",
-            "--shared-ffn",             # new flag: share one MLP across all layers
+            "--shared-ffn",
             f"--device-batch-size={DEVICE_BATCH_SIZE}",
             "--head-dim=64",
             "--window-pattern=L",
@@ -475,14 +479,15 @@ def stage_pretrain_shared_ffn() -> None:
 )
 def stage_pretrain_cla_shared_ffn() -> None:
     """
-    pico_cla_shared_ffn: d=12, CLA-2 KV sharing + shared FFN combined.
-    Tests whether the two changes are independent, synergistic, or interfering.
+    pico_cla_shared_ffn: d=34, CLA-2 KV sharing + shared FFN combined.
+    Uses d=34 to match pico_shared_ffn (iso-param to d=12 baseline).
+    CLA-2 applied on top: 17 sharing pairs at d=34.
     """
     _setup_cache()
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=12",
+            "--depth=34",
             "--aspect-ratio=64",
             "--cla-sharing=2",
             "--shared-ffn",
