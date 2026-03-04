@@ -79,7 +79,7 @@ class CausalSelfAttention(nn.Module):
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None, return_kv=False):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -92,9 +92,6 @@ class CausalSelfAttention(nn.Module):
         else:
             k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
             v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-            # Store for potential CLA reuse by the next layer
-            self._cla_k = k
-            self._cla_v = v
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         # Note: applied after CLA reuse so even CLA layers get per-layer value specialization
@@ -130,6 +127,8 @@ class CausalSelfAttention(nn.Module):
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
+        if return_kv:
+            return y, k, v
         return y
 
 
@@ -165,7 +164,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None, return_kv=False):
+        if return_kv:
+            attn_out, k, v = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv, return_kv=True)
+            x = x + attn_out
+            x = x + self.mlp(norm(x))
+            return x, k, v
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv)
         x = x + self.mlp(norm(x))
         return x
@@ -432,16 +436,19 @@ class GPT(nn.Module):
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
         cla_sharing = self.config.cla_sharing
+        shared_kv = None  # holds (k, v) from leader layer for CLA follower layers
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             if cla_sharing > 1 and i % cla_sharing != 0:
-                # CLA: this layer reuses K and V cached by the previous group-leader layer
-                prev_block = self.transformer.h[i - 1]
-                shared_kv = (prev_block.attn._cla_k, prev_block.attn._cla_v)
+                # CLA follower: reuse K and V from the leader layer via local variable
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, shared_kv=shared_kv)
+            elif cla_sharing > 1:
+                # CLA leader: compute fresh K and V, return them explicitly for the next layer
+                x, k, v = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, return_kv=True)
+                shared_kv = (k, v)
             else:
-                # Normal layer: computes fresh K and V (stored in block.attn._cla_k/v for CLA)
+                # CLA disabled: standard forward
                 x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
