@@ -30,13 +30,18 @@ Individual stages:
 
 Cost reference (8×H100 at ~$31/hr for the node, eval on 4×H100 at ~$14/hr)
 ---------------------------------------------------------------------------
-    stage_data + tokenizer         :  ~7 min    ~$3.60
-    pico_baseline      d=8  8×H100 : ~10 min    ~$5.20
-    pico_swiglu        d=8  8×H100 : ~10 min    ~$5.20
-    pico_cla           d=8  8×H100 : ~10 min    ~$5.20
-    pico_swiglu_cla    d=8  8×H100 : ~10 min    ~$5.20
-    stage_eval (bpb+CORE+sample)   : ~120 min   ~$9.30
-    Total                                       ~$33.70
+    stage_data + tokenizer         :  ~10 min   ~$5.30
+    pico_baseline      d=12 8×H100 : ~5 min     ~$2.60
+    pico_cla           d=12 8×H100 : ~5 min     ~$2.60
+    stage_eval (bpb+CORE+sample)   : ~60 min    ~$4.70
+    Total                                       ~$15.20
+
+    (swiglu and swiglu_cla stages exist but are not run in the default
+     pipeline — call them individually if needed)
+
+Note: d=8 preliminary runs (val_bpb: baseline=1.027, cla=1.050; CORE:
+baseline=0.066, cla=0.057) showed CLA hurts at shallow depth. Switched
+to d=12 for more meaningful ablation.
 
 Notes
 -----
@@ -59,14 +64,18 @@ from modal import App, Image as ModalImage, Volume, Secret
 # =============================================================================
 
 # Picochat model configs
-#   baseline : d=8, ReLU², standard MHA — control model
-#   swiglu   : d=8, SwiGLU activation   — MLP activation change (Shazeer 2020)
-#   cla      : d=8, ReLU², CLA-2 sharing — cross-layer KV reuse (Brandon 2024)
+#   baseline : d=12, ReLU², standard MHA — control model
+#   cla      : d=12, ReLU², CLA-2 sharing — cross-layer KV reuse (Brandon 2024)
+# d=12 chosen over d=8: matches reference quick_test depth (~125M params),
+# gives 6 CLA sharing pairs vs 4 at d=8, and is well-studied in LOG.md.
+# d=8 preliminary runs showed CLA hurt quality (-0.022 bpb, -13% CORE),
+# likely because adjacent layer KV representations aren't correlated enough
+# at shallow depths. d=12 provides more depth for CLA redundancy to emerge.
 CONFIGS = {
-    "pico_baseline":   {"depth": 8, "aspect_ratio": 64, "swiglu": False, "cla": False},
-    "pico_swiglu":     {"depth": 8, "aspect_ratio": 64, "swiglu": True,  "cla": False},
-    "pico_cla":        {"depth": 8, "aspect_ratio": 64, "swiglu": False, "cla": True},
-    "pico_swiglu_cla": {"depth": 8, "aspect_ratio": 64, "swiglu": True,  "cla": True},
+    "pico_baseline":   {"depth": 12, "aspect_ratio": 64, "swiglu": False, "cla": False},
+    "pico_swiglu":     {"depth": 12, "aspect_ratio": 64, "swiglu": True,  "cla": False},
+    "pico_cla":        {"depth": 12, "aspect_ratio": 64, "swiglu": False, "cla": True},
+    "pico_swiglu_cla": {"depth": 12, "aspect_ratio": 64, "swiglu": True,  "cla": True},
 }
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
@@ -81,9 +90,10 @@ _N_TRAIN_GPUS = int(GPU_TRAIN.split(":")[1]) if ":" in GPU_TRAIN else 1
 _N_EVAL_GPUS  = int(GPU_EVAL.split(":")[1])  if ":" in GPU_EVAL  else 1
 
 # ── Data ──────────────────────────────────────────────────────────────────────
-# 40 shards (~4GB) — sufficient for Chinchilla-optimal training at d=8.
-# Reference speedrun uses 240 shards for d=24; scaled proportionally (~1/6).
-NUM_SHARDS = 40
+# 80 shards (~8GB) — sufficient for Chinchilla-optimal training at d=12.
+# d=12 has ~125M params; Chinchilla at 10.5× ≈ 1.3B tokens ≈ 26 shards needed.
+# 80 shards provides comfortable headroom (~1/3 of the 240-shard speedrun).
+NUM_SHARDS = 80
 
 # ── Batch size ────────────────────────────────────────────────────────────────
 # Matches reference speedrun DEVICE_BATCH_SIZE.
@@ -268,9 +278,10 @@ def stage_tokenizer() -> None:
 )
 def stage_pretrain_baseline() -> None:
     """
-    pico_baseline: d=8, ReLU², standard MHA.
+    pico_baseline: d=12, ReLU², standard MHA.
     Control model — no changes from Feb 2026 nanochat defaults.
     Training horizon set by Chinchilla ratio (--target-param-data-ratio=10.5).
+    d=12 matches reference quick_test depth (~125M params, 6 CLA pairs).
     """
     _setup_cache()
     print("Resetting training report...")
@@ -278,7 +289,7 @@ def stage_pretrain_baseline() -> None:
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=8",
+            "--depth=12",
             "--aspect-ratio=64",
             f"--device-batch-size={DEVICE_BATCH_SIZE}",
             "--head-dim=64",
@@ -347,7 +358,7 @@ def stage_pretrain_swiglu() -> None:
 )
 def stage_pretrain_cla() -> None:
     """
-    pico_cla: d=8, CLA-2 cross-layer KV sharing.
+    pico_cla: d=12, CLA-2 cross-layer KV sharing.
     Requires --cla-sharing=2 flag implemented in gpt.py and wired in base_train.py.
     Even-numbered layers reuse K and V from the preceding odd layer.
     All other hyperparameters identical to baseline.
@@ -446,7 +457,7 @@ def stage_eval() -> None:
         volume.commit()
 
     results = {}
-    for tag in ["pico_baseline", "pico_swiglu", "pico_cla", "pico_swiglu_cla"]:
+    for tag in ["pico_baseline", "pico_cla"]:
         print(f"\n{'='*60}\nEvaluating {tag}...\n{'='*60}")
         log_path = os.path.join(NANOCHAT_CACHE, f"{tag}_eval.txt")
 
@@ -466,7 +477,7 @@ def stage_eval() -> None:
                 for line in f:
                     if "val bpb:" in line.lower():
                         val_bpb = line.strip().split(":")[-1].strip()
-                    if "core:" in line.lower() or "core score" in line.lower():
+                    if "core metric:" in line.lower():
                         core = line.strip().split(":")[-1].strip()
         results[tag] = {"val_bpb": val_bpb, "core": core}
 
@@ -517,19 +528,13 @@ def main() -> None:
     print("[1/5] Training tokenizer...")
     stage_tokenizer.remote()
 
-    print("[2a/5] Training pico_baseline...")
+    print("[2a/3] Training pico_baseline...")
     stage_pretrain_baseline.remote()
 
-    print("[2b/5] Training pico_swiglu...")
-    stage_pretrain_swiglu.remote()
-
-    print("[2c/5] Training pico_cla...")
+    print("[2b/3] Training pico_cla...")
     stage_pretrain_cla.remote()
 
-    print("[2d/5] Training pico_swiglu_cla (combined)...")
-    stage_pretrain_swiglu_cla.remote()
-
-    print("[3/5] Evaluating all 4 models (bpb + CORE + sample)...")
+    print("[3/3] Evaluating baseline + cla (bpb + CORE + sample)...")
     stage_eval.remote()
 
     print("\n" + "=" * w)
