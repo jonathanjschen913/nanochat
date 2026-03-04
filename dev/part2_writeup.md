@@ -121,16 +121,15 @@ modal run runs/pico_ablation_modal.py::stage_eval
 
 ## Results
 
-### Training metrics
+### Training metrics (d=12 main ablation)
 
-| Model | Activation | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ | tok/sec ↑ |
-|---|---|---|---|---|---|---|
-| pico_baseline | ReLU² | None (MHA) | ~125M | **[TBD]** | **[TBD]** | [TBD] |
-| pico_cla | ReLU² | CLA-2 | ~118M | **[TBD]** | **[TBD]** | [TBD] |
+| Model | Activation | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ |
+|---|---|---|---|---|---|
+| pico_baseline | ReLU² | None (MHA) | ~125M | **0.9250** | **0.1273** |
+| pico_cla | ReLU² | CLA-2 | ~118M | **1.0505** | **0.0624** |
+| GPT-2 target | — | — | ~1.5B | ~0.748 | 0.2565 |
 
-*[Fill in from Modal stage_eval output and W&B dashboard after cloud run completes.]*
-
-**Note on CORE scores:** At picochat scale (d=8, ~40M params), CORE scores will be well below the GPT-2 threshold of 0.256525 — expect values in the 0.10–0.15 range. The absolute score is not the goal; what matters is the **relative difference** between models. A meaningful CORE improvement alongside val_bpb improvement would strongly validate the architectural change.
+**Note on CORE scores:** At picochat scale (d=12, ~125M params), CORE scores are well below the GPT-2 threshold of 0.256525. The relative difference between models is what matters — a 51% drop in CORE from baseline to CLA is a strong and consistent signal.
 
 ### Preliminary results at d=8 (see Picochat Configuration section above)
 
@@ -147,26 +146,24 @@ CLA degraded quality at d=8, motivating the switch to d=12 for the main ablation
 
 ### SwiGLU (pico_swiglu vs pico_baseline)
 
-*[To be completed after cloud run. Template:]*
+*Note: SwiGLU was identified post-pilot as a previously tested negative result in nanochat's LOG.md (Feb 5 2026 entry). It was therefore not run as part of the main ablation. The CLA result is the primary contribution of this study.*
 
-The SwiGLU variant achieved a val_bpb of [X.XXX] vs the baseline's [X.XXX], a [improvement/regression] of [delta] bpb. This [supports/contradicts] Shazeer (2020)'s finding that GEGLU/SwiGLU consistently outperform ReLU by ~0.04 log-perplexity on C4.
-
-**Nanochat-specific observations:**
-- nanochat's current ReLU² is an unusual choice — squaring the ReLU output creates a smoother activation with stronger sparsity than plain ReLU. SwiGLU's multiplicative gating provides a fundamentally different inductive bias: rather than hard-zeroing negative activations, it softly gates the entire feature map. Whether this is better at picochat scale is an open question.
-- The parameter count is matched by adjusting the up-projection from `4 × n_embd` to `8/3 × n_embd`. At very small model dims (512), rounding to the nearest multiple of 64 introduces a small parameter discrepancy (~2%) which is noted but not corrected, consistent with standard practice.
-- SwiGLU's improvement in larger models is attributed partly to better gradient flow through the gating mechanism. nanochat's residual scalars (`resid_λ`, `x0_λ`) already address gradient flow at the block level — SwiGLU addresses it within the MLP. The two mechanisms are complementary.
+For completeness: Karpathy tested SwiGLU at d=12 and d=24 and found it worse on all measures — step efficiency, wall clock time, and FLOPs — compared to ReLU². The conclusion from the log: "ReLU² remains superior for nanochat." This is consistent with nanochat's use of the Muon optimizer, whose Newton-Schulz orthogonalization may interact differently with SwiGLU's gated activations than with ReLU²'s sparse activations.
 
 ### CLA (pico_cla vs pico_baseline)
 
-*[To be completed after cloud run. Template:]*
+CLA-2 achieved val_bpb of **1.0505** vs the baseline's **0.9250** — a degradation of **+0.126 bpb (+13.6%)**. CORE dropped from **0.1273 to 0.0624 (-51%)**. This is a consistent negative result across both depths tested (d=8 and d=12):
 
-The CLA-2 variant achieved a val_bpb of [X.XXX] vs the baseline's [X.XXX]. Brandon et al. (2024) reported roughly equal perplexity to a full-KV baseline at 1B scale with CLA-2, so [near-neutral/degraded] quality at picochat scale would be [consistent with/worse than] expectations.
+| Depth | Baseline val_bpb | CLA val_bpb | Δbpb | Baseline CORE | CLA CORE | ΔCORE |
+|---|---|---|---|---|---|---|
+| d=8 | 1.027 | 1.050 | +0.023 | 0.066 | 0.057 | -14% |
+| d=12 | 0.925 | 1.051 | +0.126 | 0.127 | 0.062 | -51% |
 
-The parameter reduction from CLA is meaningful: halving the KV projections removes ~[X]M parameters, which could be reinvested in depth or width in a future experiment. At picochat scale the KV cache memory savings are modest, but the architectural pattern is most valuable at larger scales and longer sequences (see Translation to Larger Runs).
+Brandon et al. (2024) reported roughly equal perplexity to a full-KV baseline at 1B scale with CLA-2. Our results are significantly worse — the degradation is larger at d=12 than d=8, which is the opposite of what the KV redundancy hypothesis predicts (deeper models should benefit more from CLA, not less).
 
-**Nanochat-specific observations:**
-- nanochat's value embeddings interact with CLA in an interesting way: even layers borrow the V projection from the preceding odd layer, but the value embedding (token-ID indexed) is still added independently at each layer. This means CLA layers are not fully identical in their value computation — they share the projection but retain per-layer value specialization through the embedding. This is a nanochat-specific advantage over vanilla transformer CLA implementations.
-- The SSSL sliding window pattern means that in 3 of every 4 layers, attention only covers half the context. CLA sharing is applied uniformly across all layer types in this experiment; a future refinement would restrict sharing to pairs of same-window-type layers.
+**Nanochat-specific explanation:** nanochat's **value embeddings** are the likely culprit. Every layer adds a token-ID-indexed embedding directly to the V tensor before attention. This means the V tensor in any given layer encodes both the layer's learned projection *and* a strong token-identity signal. When CLA follower layers reuse the leader's V projection, they inherit V representations shaped by the leader's input context — but the follower's residual stream has already been transformed by the leader's MLP and attention outputs. The mismatch between the follower's Q (computed from a deeper residual stream) and the leader's KV (computed from a shallower one) causes the quality degradation. This is a nanochat-specific interaction that does not exist in vanilla transformers used in Brandon et al.'s experiments.
+
+The parameter reduction from CLA is real (~7M fewer params from removed c_k/c_v on follower layers) but does not compensate for the quality loss at these scales.
 
 ---
 
@@ -218,8 +215,12 @@ SwiGLU's advantages are well-documented at large scale — it is the default MLP
 
 ### CLA at full scale
 
-CLA's primary motivation is memory efficiency, which scales with model size and sequence length. At d=24 with `seq_len=2048`, the KV cache per token is `2 × n_layer × n_kv_head × head_dim` bytes — roughly 48KB per token in float16. CLA-2 halves this, enabling larger effective batch sizes and longer contexts at the same memory budget. Combined with GQA (4:1 ratio), CLA-2 could yield a 4× total KV cache reduction relative to baseline MHA.
+Our results show CLA is a **negative result in nanochat at picochat scale**, contradicting Brandon et al.'s quality-neutrality finding at 1B. The degradation is consistent and worsens with depth (larger penalty at d=12 than d=8), which we attribute to nanochat's value embeddings creating a representation mismatch between leader and follower layers.
 
-The quality-neutrality finding from Brandon et al. at 1B scale is likely to hold or improve at d=24 because deeper models have more redundancy between adjacent layers' KV representations — the empirical correlation that motivates CLA grows with depth. The picochat result at d=8 is the most conservative test of this hypothesis.
+However, two factors may change the picture at full speedrun scale (d=24–26):
 
-**Practical path to the speedrun:** implement CLA-2 in the d=24 speedrun with the shared KV restricted to pairs of same-window-type layers (LL pairs share, SS pairs share, but LS boundaries do not share). This avoids the cross-window-type interaction noted in the implementation above and should be quality-neutral while delivering meaningful memory savings.
+1. **Value embeddings use alternating layers** (`has_ve` function): at d=24, only half the layers have value embeddings. A CLA implementation that restricts sharing to pairs where neither layer has a value embedding would avoid the mismatch entirely.
+
+2. **The SSSL window pattern creates natural sharing boundaries**: at d=24 with SSSL, restricting CLA to pairs of same-window-type layers (SS pairs share, LL pairs share, no cross-boundary sharing) would test CLA in a more controlled setting.
+
+These are targeted refinements that our picochat implementation did not include. A follow-up experiment at d=24 with value-embedding-aware CLA pairing would give a cleaner test of the hypothesis.
