@@ -68,10 +68,10 @@ from modal import App, Image as ModalImage, Volume, Secret
 #   cla        : d=12, ReLU², CLA-2 KV sharing (Brandon 2024) — negative result
 #   shared_ffn : d=12, ReLU², one shared MLP across all layers (MobiLlama 2024)
 CONFIGS = {
-    "pico_baseline":   {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": False},
-    "pico_swiglu":     {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": False},  # not run
-    "pico_cla":        {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": False},
-    "pico_shared_ffn": {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
+    "pico_baseline":        {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": False},
+    "pico_cla":             {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": False},
+    "pico_shared_ffn":      {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
+    "pico_cla_shared_ffn":  {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": True},
 }
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
@@ -463,6 +463,45 @@ def stage_pretrain_shared_ffn() -> None:
 
 
 # =============================================================================
+# STAGE 2e: PRETRAIN CLA + SHARED FFN (combined)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_TRAIN,
+    timeout=PRETRAIN_TIMEOUT_SEC,
+)
+def stage_pretrain_cla_shared_ffn() -> None:
+    """
+    pico_cla_shared_ffn: d=12, CLA-2 KV sharing + shared FFN combined.
+    Tests whether the two changes are independent, synergistic, or interfering.
+    """
+    _setup_cache()
+    _torchrun(
+        "scripts.base_train",
+        [
+            "--depth=12",
+            "--aspect-ratio=64",
+            "--cla-sharing=2",
+            "--shared-ffn",
+            f"--device-batch-size={DEVICE_BATCH_SIZE}",
+            "--head-dim=64",
+            "--window-pattern=L",
+            "--core-metric-every=-1",
+            "--sample-every=-1",
+            "--save-every=1000",
+            "--model-tag=pico_cla_shared_ffn",
+            f"--run={WANDB_PROJECT}_cla_shared_ffn",
+        ],
+        nproc=_N_TRAIN_GPUS,
+    )
+    volume.commit()
+    print("pico_cla_shared_ffn complete.")
+
+
+# =============================================================================
 # STAGE 3: EVAL ALL MODELS  (bpb + CORE + sample)
 # =============================================================================
 
@@ -493,7 +532,7 @@ def stage_eval() -> None:
         volume.commit()
 
     results = {}
-    for tag in ["pico_baseline", "pico_cla", "pico_shared_ffn"]:
+    for tag in ["pico_baseline", "pico_cla", "pico_shared_ffn", "pico_cla_shared_ffn"]:
         print(f"\n{'='*60}\nEvaluating {tag}...\n{'='*60}")
         log_path = os.path.join(NANOCHAT_CACHE, f"{tag}_eval.txt")
 
@@ -564,16 +603,19 @@ def main() -> None:
     print("[1/5] Training tokenizer...")
     stage_tokenizer.remote()
 
-    print("[2a/4] Training pico_baseline...")
+    print("[2a/5] Training pico_baseline...")
     stage_pretrain_baseline.remote()
 
-    print("[2b/4] Training pico_cla...")
+    print("[2b/5] Training pico_cla...")
     stage_pretrain_cla.remote()
 
-    print("[2c/4] Training pico_shared_ffn...")
+    print("[2c/5] Training pico_shared_ffn...")
     stage_pretrain_shared_ffn.remote()
 
-    print("[3/4] Evaluating all models (bpb + CORE + sample)...")
+    print("[2d/5] Training pico_cla_shared_ffn (combined)...")
+    stage_pretrain_cla_shared_ffn.remote()
+
+    print("[3/5] Evaluating all 4 models (bpb + CORE + sample)...")
     stage_eval.remote()
 
     print("\n" + "=" * w)

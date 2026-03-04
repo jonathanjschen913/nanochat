@@ -39,7 +39,7 @@ The quality degradation at d=8 is consistent with CLA's theoretical motivation: 
 
 ---
 
-## The Three Models
+## The Four Models
 
 ### Model 1: pico_baseline
 **Config:** d=12, model_dim=768, 12 heads, ReLU² activation, independent KV per layer, per-layer MLPs.
@@ -82,6 +82,11 @@ for i, block in enumerate(self.transformer.h):
 
 All other hyperparameters are identical to the baseline. The change is isolated to `gpt.py`.
 
+### Model 4: pico_cla_shared_ffn
+**Config:** d=12, model_dim=768, 12 heads, **CLA-2 KV sharing + shared FFN**.
+
+Both changes applied simultaneously. Determines whether the changes are independent, synergistic, or interfering. Since CLA operates on attention and shared FFN operates on the MLP, there is no direct architectural interaction — independence is the prior expectation.
+
 ---
 
 ## Training Setup
@@ -100,6 +105,7 @@ modal run runs/pico_ablation_modal.py
 modal run runs/pico_ablation_modal.py::stage_pretrain_baseline
 modal run runs/pico_ablation_modal.py::stage_pretrain_cla
 modal run runs/pico_ablation_modal.py::stage_pretrain_shared_ffn
+modal run runs/pico_ablation_modal.py::stage_pretrain_cla_shared_ffn
 modal run runs/pico_ablation_modal.py::stage_eval
 ```
 
@@ -114,6 +120,7 @@ modal run runs/pico_ablation_modal.py::stage_eval
 | pico_baseline | per-layer | None (MHA) | ~125M | **0.9250** | **0.1273** |
 | pico_shared_ffn | shared (1×) | None (MHA) | ~88M | **[TBD]** | **[TBD]** |
 | pico_cla | per-layer | CLA-2 | ~118M | **1.0505** | **0.0624** |
+| pico_cla_shared_ffn | shared (1×) | CLA-2 | ~81M | **[TBD]** | **[TBD]** |
 | GPT-2 target | — | — | ~1.5B | ~0.748 | 0.2565 |
 
 **Note on CORE scores:** At picochat scale (d=12, ~125M params), CORE scores are well below the GPT-2 threshold of 0.256525. The relative difference between models is what matters — a 51% drop in CORE from baseline to CLA is a strong and consistent signal.
