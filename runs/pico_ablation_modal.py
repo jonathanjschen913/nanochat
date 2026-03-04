@@ -70,10 +70,8 @@ from modal import App, Image as ModalImage, Volume, Secret
 CONFIGS = {
     "pico_baseline":        {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": False},
     "pico_cla":             {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": False},
-    "pico_shared_ffn":      {"depth": 34, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
-    "pico_cla_shared_ffn":  {"depth": 34, "aspect_ratio": 64, "cla": True,  "shared_ffn": True},
-    # Note: shared_ffn runs use d=24 to reinvest freed MLP params into depth,
-    # matching MobiLlama's design principle. d=12 baseline is the control.
+    "pico_shared_ffn":      {"depth": 12, "aspect_ratio": 64, "cla": False, "shared_ffn": True},
+    "pico_cla_shared_ffn":  {"depth": 12, "aspect_ratio": 64, "cla": True,  "shared_ffn": True},
 }
 
 # ── GPU ───────────────────────────────────────────────────────────────────────
@@ -97,6 +95,7 @@ NUM_SHARDS = 80
 # Matches reference speedrun DEVICE_BATCH_SIZE.
 # H100 80GB: 32 fits for d24 per reference; d=8 is much smaller so 32 is safe.
 DEVICE_BATCH_SIZE = 16
+DEVICE_BATCH_SIZE_DEEP = 16  # d=34 shared_ffn: model_dim=768 still fits at bs=16; activations are small
 
 # ── WandB ─────────────────────────────────────────────────────────────────────
 # Set to "dummy" to disable WandB logging
@@ -114,6 +113,7 @@ BASE_DIR       = "/data/.cache/nanochat"
 
 # Eval bundle URL (fixed, hosted by Karpathy) — mirrors reference
 EVAL_BUNDLE_URL = "https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
+
 
 # =============================================================================
 # MODAL PRIMITIVES — App, Volume, Secret, Image
@@ -305,45 +305,6 @@ def stage_pretrain_baseline() -> None:
 
 
 # =============================================================================
-# STAGE 2b: PRETRAIN SWIGLU
-# =============================================================================
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    volumes={VOLUME_MOUNT: volume},
-    gpu=GPU_TRAIN,
-    timeout=PRETRAIN_TIMEOUT_SEC,
-)
-def stage_pretrain_swiglu() -> None:
-    """
-    pico_swiglu: d=8, SwiGLU activation replacing ReLU².
-    Requires --swiglu flag implemented in gpt.py MLP and wired in base_train.py.
-    All other hyperparameters identical to baseline.
-    """
-    _setup_cache()
-    _torchrun(
-        "scripts.base_train",
-        [
-            "--depth=8",
-            "--aspect-ratio=64",
-            "--swiglu",                 # new flag: use SwiGLU instead of ReLU²
-            f"--device-batch-size={DEVICE_BATCH_SIZE}",
-            "--head-dim=64",
-            "--window-pattern=L",
-            "--core-metric-every=-1",
-            "--sample-every=-1",
-            "--save-every=1000",
-            "--model-tag=pico_swiglu",
-            f"--run={WANDB_PROJECT}_swiglu",
-        ],
-        nproc=_N_TRAIN_GPUS,
-    )
-    volume.commit()
-    print("pico_swiglu complete.")
-
-
-# =============================================================================
 # STAGE 2c: PRETRAIN CLA
 # =============================================================================
 
@@ -365,7 +326,7 @@ def stage_pretrain_cla() -> None:
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=8",
+            "--depth=12",
             "--aspect-ratio=64",
             "--cla-sharing=2",          # new flag: reuse KV every 2 layers
             f"--device-batch-size={DEVICE_BATCH_SIZE}",
@@ -383,46 +344,6 @@ def stage_pretrain_cla() -> None:
     print("pico_cla complete.")
 
 
-# =============================================================================
-# STAGE 2d: PRETRAIN SWIGLU + CLA (combined)
-# =============================================================================
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    volumes={VOLUME_MOUNT: volume},
-    gpu=GPU_TRAIN,
-    timeout=PRETRAIN_TIMEOUT_SEC,
-)
-def stage_pretrain_swiglu_cla() -> None:
-    """
-    pico_swiglu_cla: d=8, SwiGLU activation + CLA-2 KV sharing combined.
-    Tests whether the two changes compound positively, additively, or interfere.
-    If combined val_bpb ≈ swiglu_delta + cla_delta, the changes are independent.
-    If better, they synergise. If worse, they interfere.
-    """
-    _setup_cache()
-    _torchrun(
-        "scripts.base_train",
-        [
-            "--depth=8",
-            "--aspect-ratio=64",
-            "--swiglu",                 # SwiGLU activation
-            "--cla-sharing=2",          # CLA-2 KV sharing
-            f"--device-batch-size={DEVICE_BATCH_SIZE}",
-            "--head-dim=64",
-            "--window-pattern=L",
-            "--core-metric-every=-1",
-            "--sample-every=-1",
-            "--save-every=1000",
-            "--model-tag=pico_swiglu_cla",
-            f"--run={WANDB_PROJECT}_swiglu_cla",
-        ],
-        nproc=_N_TRAIN_GPUS,
-    )
-    volume.commit()
-    print("pico_swiglu_cla complete.")
-
 
 # =============================================================================
 # STAGE 2d: PRETRAIN SHARED FFN
@@ -437,18 +358,17 @@ def stage_pretrain_swiglu_cla() -> None:
 )
 def stage_pretrain_shared_ffn() -> None:
     """
-    pico_shared_ffn: d=34, one MLP shared across all transformer layers.
+    pico_shared_ffn: d=12, one MLP shared across all transformer layers.
     Implements MobiLlama (2024) FFN weight sharing.
-    d=34 is iso-parameter to the d=12 baseline (~85M transformer matrix params):
-      baseline d=12: 12 × (attn 2.36M + MLP 4.72M) = 84.9M
-      shared_ffn d=34: 34 × attn 2.36M + 1 × MLP 4.72M = 85.0M
-    This makes the comparison fair — same parameter budget, different allocation.
+    d=12 matches the baseline depth (iso-depth comparison).
+    Parameter count: 12 × 2.36M attn + 1 × 4.72M MLP = ~33M (fewer than baseline's 85M).
+    Training horizon set by Chinchilla ratio (same as baseline).
     """
     _setup_cache()
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=34",
+            "--depth=12",
             "--aspect-ratio=64",
             "--shared-ffn",
             f"--device-batch-size={DEVICE_BATCH_SIZE}",
@@ -479,15 +399,16 @@ def stage_pretrain_shared_ffn() -> None:
 )
 def stage_pretrain_cla_shared_ffn() -> None:
     """
-    pico_cla_shared_ffn: d=34, CLA-2 KV sharing + shared FFN combined.
-    Uses d=34 to match pico_shared_ffn (iso-param to d=12 baseline).
-    CLA-2 applied on top: 17 sharing pairs at d=34.
+    pico_cla_shared_ffn: d=12, CLA-2 KV sharing + shared FFN combined.
+    Both changes at d=12 to match baseline depth.
+    CLA-2 applied: 6 sharing pairs at d=12.
+    Training horizon set by Chinchilla ratio (same as baseline).
     """
     _setup_cache()
     _torchrun(
         "scripts.base_train",
         [
-            "--depth=34",
+            "--depth=12",
             "--aspect-ratio=64",
             "--cla-sharing=2",
             "--shared-ffn",
@@ -588,9 +509,7 @@ def main() -> None:
         0. Download 40 FineWeb-EDU shards       (CPU,    ~5 min,   ~$0.10)
         1. Train BPE tokenizer                  (1xH100, ~2 min,   ~$0.12)
         2a. Pretrain pico_baseline              (8xH100, ~10 min,  ~$5.20)
-        2b. Pretrain pico_swiglu                (8xH100, ~10 min,  ~$5.20)
-        2c. Pretrain pico_cla                   (8xH100, ~10 min,  ~$5.20)
-        2d. Pretrain pico_swiglu_cla            (8xH100, ~10 min,  ~$5.20)
+        2b. Pretrain pico_cla                   (8xH100, ~10 min,  ~$5.20)
         3. Eval all 4 (bpb + CORE + sample)     (4xH100, ~120 min, ~$9.30)
 
     Estimated total: ~$30-34 at H100 on-demand pricing (~$3.50/GPU/hr).

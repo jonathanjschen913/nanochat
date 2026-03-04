@@ -2,7 +2,7 @@
 
 ## Overview
 
-We select two architecture changes absent from the Feb 2026 nanochat codebase — **Cross-Layer Attention (CLA)** (Brandon et al., NeurIPS 2024) and **Shared FFN** (MobiLlama, Thawakar et al., 2024) — and measure their impact on a small nanochat configuration we call **picochat**. Both require real implementation in `gpt.py`. We train three models: a baseline and each change in isolation, comparing val_bpb and CORE score against the same d=12 baseline.
+We select two architecture changes absent from the Feb 2026 nanochat codebase — **Cross-Layer Attention (CLA)** (Brandon et al., NeurIPS 2024) and **Shared FFN** (MobiLlama, Thawakar et al., 2024) — and measure their impact on a small nanochat configuration we call **picochat**. Both require real implementation in `gpt.py`. We train four models: a baseline, each change in isolation, and both combined, comparing val_bpb and CORE score against the same d=12 baseline.
 
 ---
 
@@ -12,19 +12,19 @@ We define picochat as a depth=12 nanochat model with the following hyperparamete
 
 | Hyperparameter | Value | Rationale |
 |---|---|---|
-| `--depth` | 12 | Matches reference `quick_test` depth (~125M params); gives 6 CLA-2 sharing pairs. Preliminary d=8 runs showed CLA hurt quality (see below), motivating the switch to d=12 |
+| `--depth` | 12 | Matches reference `quick_test` depth (~85M non-embedding params); gives 6 CLA-2 sharing pairs. Preliminary d=8 runs showed CLA hurt quality, motivating the switch to d=12 |
 | `--aspect-ratio` | 64 | nanochat default; model_dim = 12 × 64 = 768 |
 | `--head-dim` | 64 | Speedrun default is 128, but at model_dim=768 that gives only 6 heads (768/128=6). head-dim=64 gives 12 heads, providing richer head diversity for CLA-2 sharing |
 | `--max-seq-len` | 512 | Sufficient for document-level context at this scale |
 | `--window-pattern` | L | Full attention; appropriate for short sequences |
 | `--device-batch-size` | 16 | Matches reference speedrun `DEVICE_BATCH_SIZE=16` |
 | Training horizon | Chinchilla (10.5×) | Automatically computed from parameter count; mirrors reference speedrun approach |
-| Data | 80 FineWeb-EDU shards | d=12 has ~125M params; Chinchilla-optimal at 10.5× ≈ 1.3B tokens ≈ 26 shards needed. 80 shards provides comfortable headroom (~1/3 of the 240-shard speedrun) |
+| Data | 80 FineWeb-EDU shards | Chinchilla-optimal token budget for ~85M params ≈ 892M tokens ≈ 20 shards needed. 80 shards provides comfortable headroom |
 | GPU | 8×H100 | Matches reference speedrun `GPU_PRETRAIN`; eval runs on 4×H100 to halve eval cost |
 
-**Justification for d=12:** We initially ran preliminary ablations at d=8 to validate the pipeline cheaply before committing to full runs. The d=8 results (Table 1 below) showed CLA *hurting* quality — val_bpb increased by 0.022 and CORE dropped from 0.066 to 0.057. The likely cause is that at d=8, adjacent layers have insufficient KV representation correlation for safe sharing — the redundancy that CLA exploits is a property of deeper models. d=12 is the reference `quick_test` depth, well-studied in the nanochat LOG.md, and provides 6 CLA sharing pairs (vs 4 at d=8), giving CLA a better chance to show its quality-neutral behaviour as reported by Brandon et al. at 1B scale.
+**Justification for d=12:** We initially ran preliminary ablations at d=8 to validate the pipeline cheaply before committing to full runs. The d=8 results showed CLA hurting quality — val_bpb increased by 0.023 and CORE dropped from 0.066 to 0.057. d=12 is the reference `quick_test` depth and provides 6 CLA sharing pairs (vs 4 at d=8), giving CLA a fairer test.
 
-**Why not larger?** d=16+ would give stronger statistical signal but each run costs ~$10+ on 8×H100, making the full ablation suite prohibitively expensive. d=12 is the sweet spot between cost and meaningful depth.
+**Why not larger?** d=16+ would give stronger statistical signal but each run costs significantly more on 8×H100. d=12 is the sweet spot between cost and meaningful depth.
 
 ### Preliminary results at d=8 (pilot runs)
 
@@ -34,8 +34,6 @@ These runs validated the pipeline and motivated the switch to d=12:
 |---|---|---|---|
 | pico_baseline (d=8) | 1.027 | 0.0660 | Control |
 | pico_cla (d=8) | 1.050 | 0.0574 | CLA hurts at d=8 |
-
-The quality degradation at d=8 is consistent with CLA's theoretical motivation: KV sharing only works when adjacent layers compute redundant representations, which requires sufficient model depth.
 
 ---
 
@@ -47,13 +45,13 @@ The quality degradation at d=8 is consistent with CLA's theoretical motivation: 
 The control model. Matches the picochat configuration above with no modifications — identical to the Feb 2026 nanochat architecture at this scale. All other models are compared against this checkpoint.
 
 ### Model 2: pico_shared_ffn
-**Config:** d=34, model_dim=768, 12 heads, ReLU² activation, **one MLP shared across all 34 layers**.
+**Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **one MLP shared across all 12 layers**.
 
-Implements MobiLlama's (Thawakar et al., 2024) FFN weight sharing. Instead of per-layer MLPs, a single MLP is instantiated at the `GPT` level and reused by every block. The freed MLP parameters are reinvested in depth (d=34 vs d=12 baseline), making this an **iso-parameter** comparison:
+Implements MobiLlama's (Thawakar et al., 2024) FFN weight sharing. Instead of per-layer MLPs, a single MLP is instantiated at the `GPT` level and reused by every block:
 
 ```
-baseline d=12:    12 × (2.36M attn + 4.72M MLP) = 84.9M params
-shared_ffn d=34:  34 × 2.36M attn  + 1 × 4.72M MLP = 85.0M params  ✓
+baseline d=12:      12 × (2.36M attn + 4.72M MLP) = 84.9M params
+shared_ffn d=12:    12 × 2.36M attn  + 1 × 4.72M MLP = ~33M params
 ```
 
 ```python
@@ -65,7 +63,7 @@ for block in self.transformer.h:
     x = block(x, ..., mlp=self.shared_mlp)  # same weights every layer
 ```
 
-This directly tests MobiLlama's core hypothesis: a single reusable MLP with more transformer depth outperforms many independent MLPs at the same parameter budget.
+This is an **iso-depth** (not iso-parameter) comparison: same number of layers as baseline, but with 52M fewer parameters due to MLP sharing. The reduced parameter count means any quality difference conflates weight sharing with raw model capacity. Training horizon set by Chinchilla ratio based on the actual ~33M param count.
 
 ### Model 3: pico_cla
 **Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **CLA-2 KV sharing**.
@@ -74,36 +72,38 @@ Implements Cross-Layer Attention with a sharing factor of 2 (Brandon et al., Neu
 
 ```python
 # In GPT.forward():
+shared_kv = None
 for i, block in enumerate(self.transformer.h):
     if cla_sharing > 1 and i % cla_sharing != 0:
-        # CLA: reuse K and V cached by the previous group-leader layer
-        prev_block = self.transformer.h[i - 1]
-        shared_kv = (prev_block.attn._cla_k, prev_block.attn._cla_v)
+        # CLA follower: reuse K and V from previous leader layer
         x = block(x, ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv)
+    elif cla_sharing > 1:
+        # CLA leader: compute fresh K/V and cache them
+        x, k, v = block(x, ve, cos_sin, window_size, kv_cache, return_kv=True)
+        shared_kv = (k, v)
     else:
-        # Normal layer: computes fresh K/V, stores in block.attn._cla_k/v
         x = block(x, ve, cos_sin, window_size, kv_cache)
 ```
 
-All other hyperparameters are identical to the baseline. The change is isolated to `gpt.py`.
+All other hyperparameters are identical to the baseline. The change is isolated to `gpt.py`. CLA follower layers do not create `c_k`/`c_v` weight matrices, reducing the parameter count by ~7M.
 
 ### Model 4: pico_cla_shared_ffn
-**Config:** d=34, model_dim=768, 12 heads, **CLA-2 KV sharing + shared FFN**.
+**Config:** d=12, model_dim=768, 12 heads, **CLA-2 KV sharing + shared FFN**.
 
-Both changes applied simultaneously. Determines whether the changes are independent, synergistic, or interfering. Since CLA operates on attention and shared FFN operates on the MLP, there is no direct architectural interaction — independence is the prior expectation.
+Both changes applied simultaneously at d=12. Determines whether the changes are independent, synergistic, or interfering. Since CLA operates on attention and shared FFN operates on the MLP, there is no direct architectural interaction — independence is the prior expectation. Parameter count is the smallest of all four models: 12 × 2.36M attn (with CLA halving KV projections) + 1 × 4.72M MLP ≈ ~26M params.
 
 ---
 
 ## Training Setup
 
-All models were trained on Modal using 8×H100 GPUs (matching the reference speedrun configuration) on 40 FineWeb-EDU shards with a shared BPE tokenizer trained on 2B characters (matching the reference speedrun.sh tokenizer exactly). Training was tracked using Weights & Biases under the project `picochat-ablation`. The training horizon was set automatically by the Chinchilla ratio (`--target-param-data-ratio=10.5`), the same mechanism used in the reference speedrun — no manual `--num-iterations` was specified.
+All models were trained on Modal using 8×H100 GPUs on 80 FineWeb-EDU shards with a shared BPE tokenizer trained on 2B characters (matching the reference speedrun.sh tokenizer exactly). Training was tracked using Weights & Biases under the project `picochat-ablation`. All four models use d=12 with Chinchilla-auto training horizon (`--target-param-data-ratio=10.5`); training steps differ between models since Chinchilla scales with parameter count.
 
 **Run commands:**
 ```bash
 # Local smoke test (verify code runs, ~3-5 min)
 bash runs/runpico_test.sh
 
-# Cloud training (full ablation, ~$34)
+# Cloud training (full ablation)
 modal run runs/pico_ablation_modal.py
 
 # Individual stages
@@ -118,19 +118,21 @@ modal run runs/pico_ablation_modal.py::stage_eval
 
 ## Results
 
-### Training metrics (d=12 main ablation)
+### Main results
 
-| Model | FFN | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ |
-|---|---|---|---|---|---|
-| pico_baseline (d=12) | per-layer | None (MHA) | ~85M | **0.9250** | **0.1273** |
-| pico_cla (d=12) | per-layer | CLA-2 | ~78M | **1.0505** | **0.0624** |
-| pico_shared_ffn (d=34) | shared (1×) | None (MHA) | ~85M | **[TBD]** | **[TBD]** |
-| pico_cla_shared_ffn (d=34) | shared (1×) | CLA-2 | ~85M | **[TBD]** | **[TBD]** |
-| GPT-2 target | — | — | ~1.5B | ~0.748 | 0.2565 |
+| Model | depth | FFN | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ | vs baseline |
+|---|---|---|---|---|---|---|---|
+| pico_baseline | 12 | per-layer | None (MHA) | ~85M | **0.9250** | **0.1273** | — |
+| pico_cla | 12 | per-layer | CLA-2 | ~78M | **0.9447** | **0.0655** | +0.020 bpb, -49% CORE |
+| pico_shared_ffn | 12 | shared (1×) | None (MHA) | ~33M | **1.0058** | **0.0810** | +0.081 bpb, -36% CORE |
+| pico_cla_shared_ffn | 12 | shared (1×) | CLA-2 | ~26M | **1.0410** | **0.0575** | +0.116 bpb, -55% CORE |
+| GPT-2 target | — | — | — | ~1.5B | ~0.748 | 0.2565 | — |
 
-**Note on CORE scores:** At picochat scale (d=12, ~125M params), CORE scores are well below the GPT-2 threshold of 0.256525. The relative difference between models is what matters — a 51% drop in CORE from baseline to CLA is a strong and consistent signal.
+**Note on CORE scores:** At picochat scale, CORE scores are well below the GPT-2 threshold of 0.256525. Relative differences between models are what matter.
 
-### Preliminary results at d=8 (see Picochat Configuration section above)
+**Note on parameter counts:** pico_shared_ffn (~33M) and pico_cla_shared_ffn (~26M) have significantly fewer parameters than the baseline (~85M) because MLP weights are shared across all layers rather than per-layer. This is an iso-depth comparison, not iso-parameter. Any quality difference partially reflects fewer parameters, not only the effect of weight sharing.
+
+### Preliminary results at d=8 (pilot runs)
 
 | Model | val_bpb | CORE |
 |---|---|---|
@@ -143,28 +145,34 @@ CLA degraded quality at d=8, motivating the switch to d=12 for the main ablation
 
 ## Commentary on Results
 
-### Shared FFN (pico_shared_ffn vs pico_baseline)
-
-*[To be completed after cloud run.]*
-
-The shared FFN variant achieved a val_bpb of [X.XXX] vs the baseline's 0.9250, and CORE of [X.XXX] vs 0.1273.
-
-MobiLlama reported 0.5B models with shared FFN achieving a 2.4% average gain over comparable SLMs on 9 benchmarks. If pico_shared_ffn shows improvement, the mechanism is efficiency: fewer MLP parameters force the shared weights to learn more general, reusable transformations rather than layer-specific ones, which may improve generalisation at sub-billion scale. If it degrades, the likely cause is that nanochat's residual scalars (`resid_λ`, `x0_λ`) already provide layer-level specialization, and the shared MLP cannot adapt to the varying residual stream depths across layers.
-
 ### CLA (pico_cla vs pico_baseline)
 
-CLA-2 achieved val_bpb of **1.0505** vs the baseline's **0.9250** — a degradation of **+0.126 bpb (+13.6%)**. CORE dropped from **0.1273 to 0.0624 (-51%)**. This is a consistent negative result across both depths tested (d=8 and d=12):
+CLA-2 achieved val_bpb of **0.9447** vs the baseline's **0.9250** — a small degradation of **+0.020 bpb (+2.1%)**. CORE dropped from **0.1273 to 0.0655 (-49%)**. This is a much milder result than the d=8 pilot:
 
 | Depth | Baseline val_bpb | CLA val_bpb | Δbpb | Baseline CORE | CLA CORE | ΔCORE |
 |---|---|---|---|---|---|---|
 | d=8 | 1.027 | 1.050 | +0.023 | 0.066 | 0.057 | -14% |
-| d=12 | 0.925 | 1.051 | +0.126 | 0.127 | 0.062 | -51% |
+| d=12 | 0.925 | 0.945 | +0.020 | 0.127 | 0.066 | -49% |
 
-Brandon et al. (2024) reported roughly equal perplexity to a full-KV baseline at 1B scale with CLA-2. Our results are significantly worse — the degradation is larger at d=12 than d=8, which is the opposite of what the KV redundancy hypothesis predicts (deeper models should benefit more from CLA, not less).
+Brandon et al. (2024) reported roughly equal perplexity to a full-KV baseline at 1B scale with CLA-2. Our val_bpb degradation at d=12 is small (+2.1%), consistent with near quality-neutrality. However, the CORE drop (-49%) is large relative to the bpb change, suggesting the model's benchmark reasoning ability is more sensitive to CLA than raw language modelling loss.
 
-**Nanochat-specific explanation:** nanochat's **value embeddings** are the likely culprit. Every layer adds a token-ID-indexed embedding directly to the V tensor before attention. This means the V tensor in any given layer encodes both the layer's learned projection *and* a strong token-identity signal. When CLA follower layers reuse the leader's V projection, they inherit V representations shaped by the leader's input context — but the follower's residual stream has already been transformed by the leader's MLP and attention outputs. The mismatch between the follower's Q (computed from a deeper residual stream) and the leader's KV (computed from a shallower one) causes the quality degradation. This is a nanochat-specific interaction that does not exist in vanilla transformers used in Brandon et al.'s experiments.
+**Nanochat-specific consideration:** nanochat's **value embeddings** add a token-ID-indexed embedding directly to the V tensor before attention. When CLA follower layers reuse the leader's V, they inherit representations shaped by the leader's shallower residual stream. This Q/KV depth mismatch may explain the CORE degradation. Brandon et al.'s experiments used vanilla transformers without value embeddings, so their quality-neutrality finding may not transfer directly.
 
-The parameter reduction from CLA is real (~7M fewer params from removed c_k/c_v on follower layers) but does not compensate for the quality loss at these scales.
+The parameter reduction from CLA is real (~7M fewer params from removed c_k/c_v on follower layers) with only a small bpb cost, suggesting CLA could be worth investigating at larger scale with value-embedding-aware pairing.
+
+### Shared FFN (pico_shared_ffn vs pico_baseline)
+
+The shared FFN variant achieved val_bpb of **1.0058** vs the baseline's **0.9250** (+8.7%), and CORE of **0.0810** vs **0.1273** (-36%).
+
+This is an **iso-depth** comparison: both models use d=12 and the same Chinchilla training budget, but pico_shared_ffn has only ~33M parameters vs the baseline's ~85M. The quality degradation therefore reflects two confounded factors: (1) the effect of MLP weight sharing, and (2) fewer total parameters. It is not possible to isolate weight sharing as the sole cause.
+
+MobiLlama reported 0.5B models with shared FFN achieving a 2.4% average gain over comparable SLMs, but their comparison was iso-parameter (freed MLP params reinvested in depth). A fair iso-parameter test would require d=34 shared_ffn (~85M params), which is significantly more expensive to train to convergence.
+
+**Why shared FFN degrades at iso-depth:** When the MLP is shared, each layer uses identical feed-forward weights regardless of position in the network. The early layers and late layers of a transformer process fundamentally different representations — early layers handle local syntactic patterns while later layers handle semantic abstractions. A single shared MLP cannot specialise for both. nanochat's residual scalars (`resid_λ`, `x0_λ`) provide per-layer output scaling that partially mitigates this, but cannot replace the expressivity of per-layer MLP weights.
+
+### Combined (pico_cla_shared_ffn vs pico_baseline)
+
+The combined model performs worse than either change in isolation (val_bpb 1.0410, +12.5%). Since both CLA and shared FFN individually degrade quality at this scale, their combination degrades further. There is no synergy — the changes appear to be independently harmful, compounding additively. This is consistent with their operating on separate architectural components (attention vs MLP).
 
 ---
 
@@ -172,13 +180,13 @@ The parameter reduction from CLA is real (~7M fewer params from removed c_k/c_v 
 
 All four training runs are tracked in W&B under the project `picochat-ablation`. The primary plots to examine:
 
-1. **val_bpb vs step** — main quality comparison; all 3 runs on the same axis
-2. **val_bpb vs total_training_flops** — iso-FLOP comparison (more honest than iso-step since CLA has fewer FLOPs per step)
+1. **val_bpb vs step** — main quality comparison; all 4 runs on the same axis
+2. **val_bpb vs total_training_flops** — iso-FLOP comparison (more honest than iso-step since CLA and deep models have different FLOPs per step)
 3. **CORE score** — evaluated once after training for each model; plotted as a bar chart
 4. **tok/sec** — throughput; CLA should be faster due to fewer KV projections
 5. **train/mfu** — model FLOP utilisation
 
-*[Insert W&B screenshot here after cloud run.]*
+*[Insert W&B screenshot here.]*
 
 ---
 
@@ -187,45 +195,39 @@ All four training runs are tracked in W&B under the project `picochat-ablation`.
 | Item | Time | GPUs | Cost |
 |---|---|---|---|
 | d=8 pilot runs (baseline + cla) | ~20 min | 8×H100 | ~$10.40 |
-| Data + tokenizer (d=12) | ~10 min | CPU / 1×H100 | ~$5.30 |
-| pico_baseline pretrain (d=12) | ~5 min | 8×H100 | ~$2.60 |
-| pico_cla pretrain (d=12) | ~5 min | 8×H100 | ~$2.60 |
-| Eval: bpb + CORE + sample (×2) | ~60 min | 4×H100 | ~$4.70 |
-| **Total** | **~100 min** | | **~$25.60** |
+| Data + tokenizer | ~10 min | CPU / 1×H100 | ~$5.30 |
+| pico_baseline pretrain (d=12, Chinchilla) | ~40 min | 8×H100 | ~$18.70 |
+| pico_cla pretrain (d=12, Chinchilla) | ~40 min | 8×H100 | ~$18.70 |
+| pico_shared_ffn pretrain (d=12, Chinchilla) | ~15 min | 8×H100 | ~$7.00 |
+| pico_cla_shared_ffn pretrain (d=12, Chinchilla) | ~15 min | 8×H100 | ~$7.00 |
+| Eval: bpb + CORE (×4 models) | ~120 min | 4×H100 | ~$28.00 |
+| **Total** | **~250 min** | | **~$90** |
 
 *Pricing based on Modal H100 on-demand rate (~$3.50/GPU/hr × 8 = $28/hr node, $14/hr for 4×H100).*
 
 **Credit efficiency decisions:**
-- `--core-metric-every=-1` skips CORE during training — CORE takes ~30 min per evaluation and is not useful mid-training at picochat scale. Instead, CORE is run once per model after training completes in `stage_eval`, giving a final comparable score for each model.
-- Eval uses 4×H100 instead of 8×H100 — `base_eval` is not as compute-bound as training; 4 GPUs gives the same result for half the cost.
-- The combined run (`pico_swiglu_cla`) adds only ~$5 to the total budget while providing the interaction analysis needed to recommend the changes together in the full speedrun.
-- 40 shards instead of 240: the Chinchilla-optimal token budget for ~40M parameters is ~420M tokens; 40 shards (~2.5B characters) exceeds this comfortably without wasting credits on redundant data.
-- Sequential pretrain stages share a single Modal Volume, avoiding race conditions and redundant tokenizer/data downloads.
-- 4×H100 instead of 8×H100 halves the GPU-hour cost with minimal wall-clock impact at d=8 scale — gradient accumulation compensates automatically.
-- Local smoke tests (d=4, 50 steps, MPS) validated all code paths before committing to cloud runs, avoiding wasted credits on broken configs.
+- `--core-metric-every=-1` skips CORE during training — CORE is run once per model after training in `stage_eval`.
+- Eval uses 4×H100 instead of 8×H100 — not compute-bound; 4 GPUs gives the same result for half the cost.
+- 80 shards instead of 240: Chinchilla-optimal for ~85M params needs ~20 shards; 80 provides headroom without redundant data.
+- Local smoke tests (d=4, 50 steps, MPS) validated all code paths before cloud runs.
+- shared_ffn runs use d=12 (iso-depth) rather than d=34 (iso-parameter) to avoid ~$190/run Chinchilla cost at d=34; the parameter count difference is acknowledged as a limitation.
 
 ---
 
 ## Translation to Larger Runs
 
-### SwiGLU at full scale
-
-SwiGLU's advantages are well-documented at large scale — it is the default MLP activation in LLaMA (7B–70B), PaLM (540B), and Mistral (7B). If the picochat result shows improvement, it is likely to be conservative: the gating mechanism's benefit compounds with model depth and width as the learned gates become more expressive. A follow-up experiment replacing ReLU² with SwiGLU in the d=24 speedrun would directly test whether the val_bpb improvement translates — this would be a strong candidate for a leaderboard submission given the zero additional compute cost.
-
-**Risk at larger scale:** nanochat's ReLU² was likely chosen deliberately — its sparsity and smoothness properties may interact well with Muon's Newton-Schulz orthogonalization in ways that SwiGLU does not. Any speedrun submission would need to verify that Muon's convergence properties are preserved.
-
 ### Shared FFN at full scale
 
-MobiLlama demonstrated shared FFN benefits at 0.5B–1B scale. At d=24 nanochat, the freed MLP parameters (~23 of 24 MLP instances) could be reinvested in greater depth or width. A meaningful follow-up would test shared FFN at d=24 with the freed parameters used to increase depth to d=28 — this would test whether the quality-neutral or better result from MobiLlama holds in nanochat's architecture with its residual scalars and value embeddings.
+MobiLlama demonstrated shared FFN benefits at 0.5B–1B scale in an iso-parameter setup (freed MLP params reinvested in depth). Our picochat result used iso-depth (d=12) rather than iso-parameter, so the quality degradation partially reflects fewer parameters. A fair test at speedrun scale would use d=34 shared_ffn (~85M params, iso-parameter with d=12 baseline) trained to Chinchilla-optimal — this is the experiment that would directly test MobiLlama's hypothesis in the nanochat architecture.
 
 ### CLA at full scale
 
-Our results show CLA is a **negative result in nanochat at picochat scale**, contradicting Brandon et al.'s quality-neutrality finding at 1B. The degradation is consistent and worsens with depth (larger penalty at d=12 than d=8), which we attribute to nanochat's value embeddings creating a representation mismatch between leader and follower layers.
+Our results show CLA causes a small val_bpb degradation (+2.1%) at d=12 picochat scale, with a larger CORE penalty (-49%). The val_bpb result is closer to Brandon et al.'s quality-neutrality finding than our initial d=8 pilot suggested.
 
-However, two factors may change the picture at full speedrun scale (d=24–26):
+Two factors may improve the picture at full speedrun scale (d=24–26):
 
-1. **Value embeddings use alternating layers** (`has_ve` function): at d=24, only half the layers have value embeddings. A CLA implementation that restricts sharing to pairs where neither layer has a value embedding would avoid the mismatch entirely.
+1. **Value embeddings use alternating layers** (`has_ve` function): at d=24, only half the layers have value embeddings. A CLA implementation that restricts sharing to pairs where neither layer has a value embedding would avoid the Q/KV depth mismatch.
 
 2. **The SSSL window pattern creates natural sharing boundaries**: at d=24 with SSSL, restricting CLA to pairs of same-window-type layers (SS pairs share, LL pairs share, no cross-boundary sharing) would test CLA in a more controlled setting.
 
-These are targeted refinements that our picochat implementation did not include. A follow-up experiment at d=24 with value-embedding-aware CLA pairing would give a cleaner test of the hypothesis.
+These refinements were not included in our picochat implementation. A follow-up at d=24 with value-embedding-aware CLA pairing is the most promising path to recovering Brandon et al.'s quality-neutrality result in nanochat.
