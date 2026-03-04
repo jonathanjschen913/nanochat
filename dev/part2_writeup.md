@@ -2,7 +2,7 @@
 
 ## Overview
 
-We select two of the three architecture changes identified in Part 1 — **SwiGLU activation** and **Cross-Layer Attention (CLA)** — and measure their impact on a small nanochat configuration we call **picochat**. Both changes are absent from the Feb 2026 nanochat codebase and require real implementation in `gpt.py`. We train four models: a baseline, each change in isolation, and both changes combined. The combined run tests whether the two changes are independent, synergistic, or interfering — a key question for recommending them together in the full speedrun.
+We select two architecture changes absent from the Feb 2026 nanochat codebase — **Cross-Layer Attention (CLA)** (Brandon et al., NeurIPS 2024) and **Shared FFN** (MobiLlama, Thawakar et al., 2024) — and measure their impact on a small nanochat configuration we call **picochat**. Both require real implementation in `gpt.py`. We train three models: a baseline and each change in isolation, comparing val_bpb and CORE score against the same d=12 baseline.
 
 ---
 
@@ -39,31 +39,28 @@ The quality degradation at d=8 is consistent with CLA's theoretical motivation: 
 
 ---
 
-## The Four Models
+## The Three Models
 
 ### Model 1: pico_baseline
-**Config:** d=12, model_dim=768, 12 heads, ReLU² activation, independent KV per layer.
+**Config:** d=12, model_dim=768, 12 heads, ReLU² activation, independent KV per layer, per-layer MLPs.
 
 The control model. Matches the picochat configuration above with no modifications — identical to the Feb 2026 nanochat architecture at this scale. All other models are compared against this checkpoint.
 
-### Model 2: pico_swiglu
-**Config:** d=12, model_dim=768, 12 heads, **SwiGLU activation**, independent KV per layer.
+### Model 2: pico_shared_ffn
+**Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **one MLP shared across all 12 layers**.
 
-Replaces the MLP's ReLU² activation with SwiGLU (Shazeer, 2020). The change is isolated to the `MLP` class in `gpt.py`:
+Implements MobiLlama's (Thawakar et al., 2024) FFN weight sharing. Instead of 12 independent MLP instances, a single MLP is instantiated at the `GPT` level and passed to every block at forward time. This reduces MLP parameters by 11/12 ≈ 92% (from 12 MLPs to 1), with total model parameter savings of roughly 30% since MLPs are the dominant parameter contributor.
 
 ```python
-# Before (ReLU²)
-x = self.c_fc(x)        # up-project to 4 * n_embd
-x = F.relu(x).square()
-x = self.c_proj(x)      # down-project
+# In GPT.__init__:
+self.shared_mlp = MLP(config)  # one MLP for all layers
 
-# After (SwiGLU)
-x, gate = self.c_gate(x).chunk(2, dim=-1)  # up-project to 8/3 * n_embd, split
-x = x * F.silu(gate)                        # gated activation
-x = self.c_proj(x)                          # down-project
+# In GPT.forward:
+for block in self.transformer.h:
+    x = block(x, ..., mlp=self.shared_mlp)  # same weights every layer
 ```
 
-The up-projection width changes from `4 × n_embd` to `8/3 × n_embd` (rounded to nearest multiple of 64) so that parameter count remains approximately equal to the baseline. This is the standard parameter-matching convention used in LLaMA and PaLM.
+The freed parameters could in principle be reinvested in more depth, but in this ablation we hold depth constant to isolate the effect of sharing.
 
 ### Model 3: pico_cla
 **Config:** d=12, model_dim=768, 12 heads, ReLU² activation, **CLA-2 KV sharing**.
@@ -85,16 +82,6 @@ for i, block in enumerate(self.transformer.h):
 
 All other hyperparameters are identical to the baseline. The change is isolated to `gpt.py`.
 
-### Model 4: pico_swiglu_cla
-**Config:** d=12, model_dim=768, 12 heads, **SwiGLU activation + CLA-2 KV sharing**.
-
-Both changes applied simultaneously. The expected val_bpb allows us to determine whether the changes are:
-- **Independent**: combined Δbpb ≈ swiglu Δbpb + cla Δbpb
-- **Synergistic**: combined Δbpb > sum of individual deltas
-- **Interfering**: combined Δbpb < sum of individual deltas
-
-CLA reuses V projections across layers; SwiGLU changes how the MLP transforms features before they become the next layer's input. There is no obvious direct interaction between them, so independence is the prior expectation — but empirical confirmation is valuable.
-
 ---
 
 ## Training Setup
@@ -111,9 +98,8 @@ modal run runs/pico_ablation_modal.py
 
 # Individual stages
 modal run runs/pico_ablation_modal.py::stage_pretrain_baseline
-modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu
 modal run runs/pico_ablation_modal.py::stage_pretrain_cla
-modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu_cla
+modal run runs/pico_ablation_modal.py::stage_pretrain_shared_ffn
 modal run runs/pico_ablation_modal.py::stage_eval
 ```
 
@@ -123,10 +109,11 @@ modal run runs/pico_ablation_modal.py::stage_eval
 
 ### Training metrics (d=12 main ablation)
 
-| Model | Activation | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ |
+| Model | FFN | KV sharing | Params (non-emb) | val_bpb ↓ | CORE ↑ |
 |---|---|---|---|---|---|
-| pico_baseline | ReLU² | None (MHA) | ~125M | **0.9250** | **0.1273** |
-| pico_cla | ReLU² | CLA-2 | ~118M | **1.0505** | **0.0624** |
+| pico_baseline | per-layer | None (MHA) | ~125M | **0.9250** | **0.1273** |
+| pico_shared_ffn | shared (1×) | None (MHA) | ~88M | **[TBD]** | **[TBD]** |
+| pico_cla | per-layer | CLA-2 | ~118M | **1.0505** | **0.0624** |
 | GPT-2 target | — | — | ~1.5B | ~0.748 | 0.2565 |
 
 **Note on CORE scores:** At picochat scale (d=12, ~125M params), CORE scores are well below the GPT-2 threshold of 0.256525. The relative difference between models is what matters — a 51% drop in CORE from baseline to CLA is a strong and consistent signal.
@@ -144,11 +131,13 @@ CLA degraded quality at d=8, motivating the switch to d=12 for the main ablation
 
 ## Commentary on Results
 
-### SwiGLU (pico_swiglu vs pico_baseline)
+### Shared FFN (pico_shared_ffn vs pico_baseline)
 
-*Note: SwiGLU was identified post-pilot as a previously tested negative result in nanochat's LOG.md (Feb 5 2026 entry). It was therefore not run as part of the main ablation. The CLA result is the primary contribution of this study.*
+*[To be completed after cloud run.]*
 
-For completeness: Karpathy tested SwiGLU at d=12 and d=24 and found it worse on all measures — step efficiency, wall clock time, and FLOPs — compared to ReLU². The conclusion from the log: "ReLU² remains superior for nanochat." This is consistent with nanochat's use of the Muon optimizer, whose Newton-Schulz orthogonalization may interact differently with SwiGLU's gated activations than with ReLU²'s sparse activations.
+The shared FFN variant achieved a val_bpb of [X.XXX] vs the baseline's 0.9250, and CORE of [X.XXX] vs 0.1273.
+
+MobiLlama reported 0.5B models with shared FFN achieving a 2.4% average gain over comparable SLMs on 9 benchmarks. If pico_shared_ffn shows improvement, the mechanism is efficiency: fewer MLP parameters force the shared weights to learn more general, reusable transformations rather than layer-specific ones, which may improve generalisation at sub-billion scale. If it degrades, the likely cause is that nanochat's residual scalars (`resid_λ`, `x0_λ`) already provide layer-level specialization, and the shared MLP cannot adapt to the varying residual stream depths across layers.
 
 ### CLA (pico_cla vs pico_baseline)
 
@@ -212,6 +201,10 @@ All four training runs are tracked in W&B under the project `picochat-ablation`.
 SwiGLU's advantages are well-documented at large scale — it is the default MLP activation in LLaMA (7B–70B), PaLM (540B), and Mistral (7B). If the picochat result shows improvement, it is likely to be conservative: the gating mechanism's benefit compounds with model depth and width as the learned gates become more expressive. A follow-up experiment replacing ReLU² with SwiGLU in the d=24 speedrun would directly test whether the val_bpb improvement translates — this would be a strong candidate for a leaderboard submission given the zero additional compute cost.
 
 **Risk at larger scale:** nanochat's ReLU² was likely chosen deliberately — its sparsity and smoothness properties may interact well with Muon's Newton-Schulz orthogonalization in ways that SwiGLU does not. Any speedrun submission would need to verify that Muon's convergence properties are preserved.
+
+### Shared FFN at full scale
+
+MobiLlama demonstrated shared FFN benefits at 0.5B–1B scale. At d=24 nanochat, the freed MLP parameters (~23 of 24 MLP instances) could be reinvested in greater depth or width. A meaningful follow-up would test shared FFN at d=24 with the freed parameters used to increase depth to d=28 — this would test whether the quality-neutral or better result from MobiLlama holds in nanochat's architecture with its residual scalars and value embeddings.
 
 ### CLA at full scale
 

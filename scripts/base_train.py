@@ -52,6 +52,7 @@ parser.add_argument("--head-dim", type=int, default=128, help="target head dimen
 parser.add_argument("--n-kv-heads", type=int, default=-1, help="number of KV heads for GQA (-1 = same as n_head, i.e. MHA)")
 parser.add_argument("--swiglu", action="store_true", help="use SwiGLU activation in MLP instead of ReLU²")
 parser.add_argument("--cla-sharing", type=int, default=1, help="CLA KV sharing factor: 1=disabled, 2=CLA-2 (every 2 layers share KV)")
+parser.add_argument("--shared-ffn", action="store_true", help="share one MLP across all transformer layers (MobiLlama 2024)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -135,7 +136,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=args.n_kv_heads if args.n_kv_heads > 0 else num_heads, n_embd=model_dim,
-        swiglu=args.swiglu, cla_sharing=args.cla_sharing,
+        swiglu=args.swiglu, cla_sharing=args.cla_sharing, shared_ffn=args.shared_ffn,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
