@@ -127,7 +127,8 @@ secret = Secret.from_name("nanochat-secrets")
 image = (
     ModalImage.from_registry("nvidia/cuda:12.8.1-devel-ubuntu24.04", add_python="3.11")
     .apt_install("git", "build-essential", "curl", "wget", "unzip")
-    .add_local_dir(local_path=".", remote_path="/root/nanochat", copy=True)
+    .add_local_dir(local_path=".", remote_path="/root/nanochat", copy=True,
+                   ignore=[".venv", "__pycache__", "*.pyc", ".git"])
     .workdir("/root/nanochat")
     .run_commands(
         "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y",
@@ -142,7 +143,6 @@ image = (
         "NANOCHAT_BASE_DIR": BASE_DIR,
         "HF_HOME": "/data/.cache/huggingface",
     })
-    .run_commands("ls /root/nanochat/.venv/bin/python || echo 'VENV NOT FOUND'")
     .run_commands(
         "cd /root/nanochat && uv sync --extra gpu --no-install-project",
     )
