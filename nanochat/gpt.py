@@ -50,6 +50,11 @@ class GPTConfig:
     # Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)
     # Two softmax maps whose difference cancels attention noise, focusing on relevant tokens
     differential_attn: bool = False
+    # Mixture of Depths (Raposo et al., arXiv 2404.02258)
+    # Even-indexed layers route top mod_capacity fraction of tokens; odd layers are full-capacity.
+    # Incompatible with cla_sharing > 1. KV cache inference not supported.
+    mod_routing: bool = False
+    mod_capacity: float = 0.125  # top 12.5% of tokens pass through MoD layers (paper recommendation)
 
 
 def norm(x):
@@ -251,6 +256,16 @@ class MLP(nn.Module):
         return x
 
 
+class MoDRouter(nn.Module):
+    """Scalar router for Mixture of Depths. Projects n_embd -> 1 (no bias)."""
+    def __init__(self, n_embd: int):
+        super().__init__()
+        self.proj = nn.Linear(n_embd, 1, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)  # (B, T, 1)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -259,10 +274,63 @@ class Block(nn.Module):
         # is owned by GPT and passed in at forward time to avoid duplicate params.
         if not config.shared_ffn:
             self.mlp = MLP(config)
+        # MoD router on even-indexed layers only
+        self.mod_router = (
+            MoDRouter(config.n_embd)
+            if config.mod_routing and layer_idx % 2 == 0
+            else None
+        )
+        self._mod_capacity_frac = config.mod_capacity
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None, return_kv=False, mlp=None):
         # mlp argument allows GPT to pass in the shared MLP when shared_ffn=True
         active_mlp = mlp if mlp is not None else self.mlp
+
+        if self.mod_router is not None:
+            if kv_cache is not None:
+                raise NotImplementedError("KV cache inference not supported for MoD layers.")
+            B, T, D_embd = x.shape
+            capacity = max(1, int(self._mod_capacity_frac * T))
+
+            # 1. Router scores + top-k selection
+            router_weights = self.mod_router(x).squeeze(-1)          # (B, T)
+            _, top_indices = torch.topk(router_weights, capacity, dim=1)
+
+            # 2. Sort by original position for causal RoPE correctness
+            sorted_positions, _ = torch.sort(top_indices, dim=1)     # (B, capacity)
+
+            # 3. Gather selected tokens
+            gather_e = sorted_positions[:, :, None].expand(-1, -1, D_embd)
+            x_sel = x.gather(1, gather_e)                            # (B, capacity, D_embd)
+
+            # 4. Gather router weights at sorted positions
+            router_w_sel = router_weights.gather(1, sorted_positions).unsqueeze(-1)  # (B, capacity, 1)
+
+            # 5. Gather cos/sin at original positions
+            cos, sin = cos_sin
+            D2 = cos.size(-1)
+            gather_r = sorted_positions[:, :, None, None].expand(-1, -1, 1, D2)
+            cos_sel = cos.expand(B, -1, -1, -1).gather(1, gather_r)  # (B, capacity, 1, D2)
+            sin_sel = sin.expand(B, -1, -1, -1).gather(1, gather_r)
+
+            # 6. Gather value embeddings at selected positions (if present)
+            ve_sel = None
+            if ve is not None:
+                gather_v = sorted_positions[:, :, None].expand(-1, -1, ve.size(-1))
+                ve_sel = ve.gather(1, gather_v)
+
+            # 7. Run attention + MLP on compact tensor
+            x_out = x_sel + self.attn(norm(x_sel), ve_sel, (cos_sel, sin_sel),
+                                      window_size, kv_cache=None, shared_kv=None)
+            x_out = x_out + active_mlp(norm(x_out))
+
+            # 8. Weighted delta + scatter back
+            delta = x_out - x_sel
+            weighted_delta = router_w_sel * delta                    # (B, capacity, D_embd)
+            x = x.scatter_add(1, gather_e, weighted_delta)
+            return x
+
+        # --- Standard path (odd layers, or mod_routing=False) ---
         if return_kv:
             attn_out, k, v = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv, return_kv=True)
             x = x + attn_out
@@ -285,6 +353,8 @@ class GPT(nn.Module):
         # Compute per-layer window sizes for sliding window attention
         # window_size is (left, right) tuple: (-1, 0) for full context, (N, 0) for sliding window
         self.window_sizes = self._compute_window_sizes(config)
+        if config.mod_routing and config.cla_sharing > 1:
+            raise ValueError("mod_routing=True is incompatible with cla_sharing > 1.")
         # Pad vocab for efficiency (DDP, tensor cores). This is just an optimization - outputs are cropped in forward().
         # https://huggingface.co/docs/transformers/main_classes/model#transformers.PreTrainedModel.resize_token_embeddings
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
@@ -375,6 +445,11 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # MoD router: zero init so weighted_delta=0 at step 0 (MoD layers start as pure residuals)
+        for block in self.transformer.h:
+            if block.mod_router is not None:
+                torch.nn.init.zeros_(block.mod_router.proj.weight)
+
         # Differential attention lambda vectors: small normal init (per paper)
         if self.config.differential_attn:
             for block in self.transformer.h:
@@ -463,9 +538,12 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for i, window_size in enumerate(self.window_sizes):
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
+            if self.config.mod_routing and i % 2 == 0:
+                effective_seq = max(1, int(self.config.mod_capacity * t))
+            else:
+                effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token

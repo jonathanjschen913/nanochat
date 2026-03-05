@@ -4,11 +4,11 @@ Part 2 Ablation Study — Picochat on Modal
 
 Trains 4 picochat models at d=12 and compares them:
   - pico_baseline       : standard MHA, per-layer KV
-  - pico_cla            : CLA-2 cross-layer KV sharing (Brandon et al., NeurIPS 2024)
+  - pico_mod            : Mixture of Depths routing (Raposo et al., arXiv 2404.02258)
   - pico_diff_attn      : Differential Attention (Ye et al., ICLR 2025)
-  - pico_cla_diff_attn  : CLA-2 + Differential Attention combined
+  - pico_mod_diff_attn  : MoD + Differential Attention combined
 
-The combined run tests whether CLA and Differential Attention interact positively,
+The combined run tests whether MoD routing and Differential Attention interact positively,
 negatively, or independently when both are applied together.
 
 Usage
@@ -23,18 +23,18 @@ Individual stages:
     modal run runs/pico_ablation_modal.py::stage_data
     modal run runs/pico_ablation_modal.py::stage_tokenizer
     modal run runs/pico_ablation_modal.py::stage_pretrain_baseline
-    modal run runs/pico_ablation_modal.py::stage_pretrain_cla
+    modal run runs/pico_ablation_modal.py::stage_pretrain_mod
     modal run runs/pico_ablation_modal.py::stage_pretrain_diff_attn
-    modal run runs/pico_ablation_modal.py::stage_pretrain_cla_diff_attn
+    modal run runs/pico_ablation_modal.py::stage_pretrain_mod_diff_attn
     modal run runs/pico_ablation_modal.py::stage_eval
 
 Cost reference (8×H100 at ~$28/hr, eval on 4×H100 at ~$14/hr)
 ---------------------------------------------------------------
     stage_data + tokenizer         : ~10 min    ~$5.30
     pico_baseline      d=12 8×H100 : ~40 min    ~$18.70
-    pico_cla           d=12 8×H100 : ~40 min    ~$18.70
+    pico_mod           d=12 8×H100 : ~40 min    ~$18.70
     pico_diff_attn     d=12 8×H100 : ~40 min    ~$18.70
-    pico_cla_diff_attn d=12 8×H100 : ~40 min    ~$18.70
+    pico_mod_diff_attn d=12 8×H100 : ~40 min    ~$18.70
     stage_eval (bpb+CORE, 4 models): ~120 min   ~$28.00
     Total                                       ~$108
 
@@ -462,6 +462,84 @@ def stage_pretrain_diff_attn() -> None:
 
 
 # =============================================================================
+# STAGE 2b: PRETRAIN MoD
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_TRAIN,
+    timeout=PRETRAIN_TIMEOUT_SEC,
+)
+def stage_pretrain_mod() -> None:
+    """
+    pico_mod: d=12, Mixture of Depths routing (Raposo et al., arXiv 2404.02258).
+    Even-indexed layers route top 12.5% of tokens through attention+MLP; odd layers are full-capacity.
+    All other hyperparameters identical to baseline.
+    """
+    _setup_cache()
+    _torchrun(
+        "scripts.base_train",
+        [
+            "--depth=12",
+            "--aspect-ratio=64",
+            "--mod-routing",
+            f"--device-batch-size={DEVICE_BATCH_SIZE}",
+            "--head-dim=64",
+            "--window-pattern=L",
+            "--core-metric-every=-1",
+            "--sample-every=-1",
+            "--save-every=1000",
+            "--model-tag=pico_mod",
+            f"--run={WANDB_PROJECT}_mod",
+        ],
+        nproc=_N_TRAIN_GPUS,
+    )
+    volume.commit()
+    print("pico_mod complete.")
+
+
+# =============================================================================
+# STAGE 2h: PRETRAIN MoD + DIFFERENTIAL ATTENTION (combined)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_TRAIN,
+    timeout=PRETRAIN_TIMEOUT_SEC,
+)
+def stage_pretrain_mod_diff_attn() -> None:
+    """
+    pico_mod_diff_attn: d=12, Mixture of Depths + Differential Attention combined.
+    Tests whether MoD routing and differential attention interact positively, negatively, or independently.
+    """
+    _setup_cache()
+    _torchrun(
+        "scripts.base_train",
+        [
+            "--depth=12",
+            "--aspect-ratio=64",
+            "--mod-routing",
+            "--differential-attn",
+            f"--device-batch-size={DEVICE_BATCH_SIZE}",
+            "--head-dim=64",
+            "--window-pattern=L",
+            "--core-metric-every=-1",
+            "--sample-every=-1",
+            "--save-every=1000",
+            "--model-tag=pico_mod_diff_attn",
+            f"--run={WANDB_PROJECT}_mod_diff_attn",
+        ],
+        nproc=_N_TRAIN_GPUS,
+    )
+    volume.commit()
+    print("pico_mod_diff_attn complete.")
+
+
+# =============================================================================
 # STAGE 2g: PRETRAIN CLA + DIFFERENTIAL ATTENTION (combined)
 # =============================================================================
 
@@ -531,11 +609,11 @@ def stage_eval() -> None:
         _run(f"unzip -q {zip_path} -d {NANOCHAT_CACHE} && rm {zip_path}")
         volume.commit()
 
-    # diff_attn models skip sample eval: Engine uses KV cache which is not
-    # implemented for differential attention.
-    NO_SAMPLE_TAGS = {"pico_diff_attn", "pico_cla_diff_attn"}
+    # diff_attn and mod models skip sample eval: Engine uses KV cache which is not
+    # implemented for differential attention or MoD layers.
+    NO_SAMPLE_TAGS = {"pico_diff_attn", "pico_cla_diff_attn", "pico_mod", "pico_mod_diff_attn"}
 
-    MAIN_TAGS = ["pico_baseline", "pico_cla", "pico_diff_attn", "pico_cla_diff_attn"]
+    MAIN_TAGS = ["pico_baseline", "pico_mod", "pico_diff_attn", "pico_mod_diff_attn"]
 
     results = {}
     for tag in MAIN_TAGS:
@@ -585,14 +663,14 @@ def stage_eval() -> None:
 @app.local_entrypoint()
 def main() -> None:
     """
-    Full Part 2 ablation pipeline — baseline, CLA, Differential Attention, combined.
+    Full Part 2 ablation pipeline — baseline, MoD, Differential Attention, combined.
 
         0. Download 80 FineWeb-EDU shards        (CPU,    ~10 min,  ~$0.10)
         1. Train BPE tokenizer                   (1xH100, ~2 min,   ~$0.12)
         2a. Pretrain pico_baseline               (8xH100, ~40 min,  ~$18.70)
-        2b. Pretrain pico_cla                    (8xH100, ~40 min,  ~$18.70)
+        2b. Pretrain pico_mod                    (8xH100, ~40 min,  ~$18.70)
         2c. Pretrain pico_diff_attn              (8xH100, ~40 min,  ~$18.70)
-        2d. Pretrain pico_cla_diff_attn          (8xH100, ~40 min,  ~$18.70)
+        2d. Pretrain pico_mod_diff_attn          (8xH100, ~40 min,  ~$18.70)
         3.  Eval 4 models (bpb + CORE + sample)  (4xH100, ~120 min, ~$28.00)
 
     Estimated total: ~$103-108 at H100 on-demand pricing (~$3.50/GPU/hr).
@@ -600,7 +678,7 @@ def main() -> None:
     w = 64
     print("\n" + "=" * w)
     print("Picochat Ablation Study — Part 2")
-    print(f"  Models : pico_baseline, pico_cla, pico_diff_attn, pico_cla_diff_attn")
+    print(f"  Models : pico_baseline, pico_mod, pico_diff_attn, pico_mod_diff_attn")
     print(f"  GPU    : {GPU_TRAIN}  |  Shards: {NUM_SHARDS}  |  WandB: {WANDB_PROJECT}")
     print("=" * w + "\n")
 
@@ -613,20 +691,20 @@ def main() -> None:
     print("[2a/6] Training pico_baseline...")
     stage_pretrain_baseline.remote()
 
-    print("[2b/6] Training pico_cla...")
-    stage_pretrain_cla.remote()
+    print("[2b/6] Training pico_mod...")
+    stage_pretrain_mod.remote()
 
     print("[2c/6] Training pico_diff_attn...")
     stage_pretrain_diff_attn.remote()
 
-    print("[2d/6] Training pico_cla_diff_attn (combined)...")
-    stage_pretrain_cla_diff_attn.remote()
+    print("[2d/6] Training pico_mod_diff_attn (combined)...")
+    stage_pretrain_mod_diff_attn.remote()
 
     print("[3/6] Evaluating 4 models (bpb + CORE)...")
     stage_eval.remote()
 
     print("\n" + "=" * w)
-    print("Ablation complete!")
+    print("Ablation complete! Models: pico_baseline, pico_mod, pico_diff_attn, pico_mod_diff_attn")
     print("  Checkpoints + eval logs in Modal Volume 'nanochat-vol'")
     print(f"  W&B: https://wandb.ai/your-username/{WANDB_PROJECT}")
     print("=" * w + "\n")
