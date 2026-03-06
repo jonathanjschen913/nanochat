@@ -133,7 +133,22 @@ The +0.1% bpb and −7.8% CORE result at d=12 established two distinct failure m
 At d=26, nanochat+diff_attn achieves val_bpb=0.7576 and CORE=0.2405. The bpb is +1.5% above the developer baseline (0.74645), a larger penalty than the +0.1% seen at d=12 — likely due to the larger model being more sensitive to the reduced head diversity (13 super-heads vs 26 standard heads). CORE of 0.2405 falls below the GPT-2 threshold of 0.2565 (−7.6% relative to baseline's 0.26024), consistent with the d=12 pattern where CORE was more affected than bpb. The QK-norm constraint remains the dominant factor: Muon requires QK-norm for bfloat16 stability, which limits the dynamic range of the differential subtraction A1 − λ·A2 regardless of depth.
 
 **Does the improvement scale?**
-The bpb penalty grew from +0.1% (d=12) to +1.5% (d=26), and the CORE penalty remained similar (−7.8% at d=12 vs −7.6% at d=26). The lambda saturation argument partially holds — the CORE gap did not widen — but the expected shrinkage did not materialise. The persistent QK-norm constraint dominates at both scales, preventing the differential mechanism from fully exploiting its noise-cancellation capacity. The scaling law shows nanochat+diff_attn is +2.0% worse than the baseline trajectory predicts (0.7576 vs 0.7430), confirming that the diff_attn bpb penalty grows with scale rather than staying constant.
+
+The short answer is no — differential attention does not improve over baseline at either scale, and the penalty grows with scale rather than shrinking.
+
+At picochat scale (d=12), the bpb penalty was negligible (+0.1%) but CORE dropped −7.8%. At nanochat scale (d=26), the bpb penalty grew to +1.5% and CORE dropped −7.6%. The scaling law makes this concrete: if differential attention scaled identically to the baseline, nanochat+diff_attn should achieve val_bpb=0.7430; the actual result of 0.7576 is +2.0% worse, meaning the architecture change incurs an increasing cost as compute scales up.
+
+**Why didn't it scale?**
+
+Three factors explain the lack of improvement:
+
+1. **Attention size did not scale proportionally.** Differential attention halves the number of heads — at d=12 this gives 6 super-heads, at d=26 it gives 13 super-heads. While 13 > 6, the *ratio* of heads to model dimension is unchanged: both have `n_head / n_embd = 1/128`. The original differential attention paper (Ye et al., 2025) reports gains on models where the head count is large enough to support diverse attention patterns after halving. In nanochat, the head count is already constrained by the `head_dim=64` requirement for even division, so the effective attention capacity does not grow relative to model size. The noise-cancellation benefit of the differential subtraction requires sufficient head diversity — with the same head-to-dimension ratio at both scales, this benefit does not compound with depth.
+
+2. **QK-norm constrains the differential subtraction.** Muon requires QK-norm for bfloat16 training stability. QK-norm normalises the Q and K vectors to unit norm, which homogenises the distribution of attention logits across the two groups (Q1,K1) and (Q2,K2). The differential mechanism relies on A1 − λ·A2 having high dynamic range — if both attention maps have similar logit scales due to QK-norm, the subtraction cancels useful signal along with noise. This constraint is identical at d=12 and d=26, so the mechanism is equally limited at both scales.
+
+3. **Lambda saturation prediction did not hold.** We predicted the CORE deficit would shrink at d=26 because more layers have `lambda_init > 0.74`, giving stronger differential weighting. In practice, CORE penalty stayed at ~−7.7% at both scales. The lambda values may be dominated by the learned parameters (lambda_q1, lambda_k1, etc.) rather than the initialisation schedule, or the QK-norm constraint suppresses the benefit of higher lambda regardless.
+
+Together, these factors suggest that the gains reported in the original differential attention paper are conditioned on training without QK-norm and with sufficient head counts — neither of which holds in the nanochat setup with Muon optimisation. Future work could explore relaxing the QK-norm constraint for diff_attn layers specifically, or using a larger head_dim to increase per-head capacity without reducing head count.
 
 ---
 
