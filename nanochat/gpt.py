@@ -38,9 +38,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # FFN sharing: share one MLP across all transformer layers (MobiLlama, 2024)
-    # When True, all blocks use the same MLP weights instead of per-layer MLPs
-    shared_ffn: bool = False
     # Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)
     # Two softmax maps whose difference cancels attention noise, focusing on relevant tokens
     differential_attn: bool = False
@@ -100,8 +97,6 @@ class CausalSelfAttention(nn.Module):
             self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim))
             # Fixed init scalar (not learned): lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
             self.lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
-            # Per-head RMSNorm over 2*head_dim, no learnable params
-            self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
         else:
             self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
             self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -124,13 +119,18 @@ class CausalSelfAttention(nn.Module):
 
             k_full = self.c_k(x).view(B, T, self.n_kv_head, 2, self.head_dim)
             k1, k2 = k_full[..., 0, :], k_full[..., 1, :]
-            v = self.c_v(x).view(B, T, self.n_kv_head, 2 * self.head_dim)
+            # V is projected to 2*head_dim and split into v1, v2 (each head_dim).
+            # This avoids passing D_v != D_q to SDPA, which produces incorrect output
+            # shapes in torch.compile on MPS (MPS SDPA assumes D_out == D_q).
+            v_full = self.c_v(x).view(B, T, self.n_kv_head, 2, self.head_dim)
+            v1, v2 = v_full[..., 0, :], v_full[..., 1, :]  # (B, T, n_kv_head, head_dim) each
 
-            # Value embedding (ve shape: (B, T, n_kv_head * 2 * head_dim))
+            # Value embedding applied to v1 and v2 separately
             if ve is not None:
-                ve = ve.view(B, T, self.n_kv_head, 2 * self.head_dim)
+                ve_split = ve.view(B, T, self.n_kv_head, 2, self.head_dim)
                 gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
-                v = v + gate.unsqueeze(-1) * ve
+                v1 = v1 + gate.unsqueeze(-1) * ve_split[..., 0, :]
+                v2 = v2 + gate.unsqueeze(-1) * ve_split[..., 1, :]
 
             # RoPE + QK-norm for all four groups.
             # QK-norm is required for training stability with Muon: without it,
@@ -145,13 +145,19 @@ class CausalSelfAttention(nn.Module):
                    - torch.dot(self.lambda_q2, self.lambda_k2).clamp(-10, 10).exp()
                    + self.lambda_init)
 
-            # Two attention maps over the same V (shape: (B, T, n_head, 2*head_dim))
-            A1 = flash_attn.flash_attn_func(q1, k1, v, causal=True, window_size=window_size)
-            A2 = flash_attn.flash_attn_func(q2, k2, v, causal=True, window_size=window_size)
-            y = A1 - lam * A2  # (B, T, n_head, 2*head_dim)
+            # Batch q1/q2 and k1/k2 into 2B so each v-half needs only one attention call.
+            # By linearity: attn(q,k,cat(v1,v2)) = cat(attn(q,k,v1), attn(q,k,v2))
+            q_cat = torch.cat([q1, q2], dim=0)   # (2B, T, n_head, head_dim)
+            k_cat = torch.cat([k1, k2], dim=0)   # (2B, T, n_kv_head, head_dim)
+            v1_rep = torch.cat([v1, v1], dim=0)  # (2B, T, n_kv_head, head_dim)
+            v2_rep = torch.cat([v2, v2], dim=0)  # (2B, T, n_kv_head, head_dim)
+            Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
+            Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+            # Split back and compute differential subtraction per v-half
+            y = torch.cat([Ap1[:B] - lam * Ap1[B:], Ap2[:B] - lam * Ap2[B:]], dim=-1)  # (B, T, n_head, 2*head_dim)
 
             # Per-head RMSNorm scaled by (1 - lambda_init)
-            y = self.subln(y) * (1 - self.lambda_init)
+            y = F.rms_norm(y, (2 * self.head_dim,)) * (1 - self.lambda_init)
 
             y = y.contiguous().view(B, T, -1)  # (B, T, n_embd)
             y = self.c_proj(y)
@@ -226,10 +232,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        # If shared_ffn is enabled, this block's mlp is unused — the shared MLP
-        # is owned by GPT and passed in at forward time to avoid duplicate params.
-        if not config.shared_ffn:
-            self.mlp = MLP(config)
+        self.mlp = MLP(config)
         # MoD router on even-indexed layers only
         self.mod_router = (
             MoDRouter(config.n_embd)
@@ -238,9 +241,8 @@ class Block(nn.Module):
         )
         self._mod_capacity_frac = config.mod_capacity
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, mlp=None):
-        # mlp argument allows GPT to pass in the shared MLP when shared_ffn=True
-        active_mlp = mlp if mlp is not None else self.mlp
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        active_mlp = self.mlp
 
         if self.mod_router is not None:
             if kv_cache is not None:
@@ -313,9 +315,6 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        # Shared FFN (MobiLlama): one MLP owned here, passed to every block at forward time.
-        # Block.mlp is not created when shared_ffn=True, so no duplicate parameters.
-        self.shared_mlp = MLP(config) if config.shared_ffn else None
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -365,14 +364,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            if not self.config.shared_ffn:
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-        # Shared FFN init (done once, not per-block)
-        if self.config.shared_ffn:
-            torch.nn.init.uniform_(self.shared_mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(self.shared_mlp.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -507,8 +500,6 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        if self.shared_mlp is not None:
-            transformer_matrices += sum(p.numel() for p in self.shared_mlp.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -530,9 +521,6 @@ class GPT(nn.Module):
         all_h_params = list(self.transformer.h.parameters())
         matrix_params = [p for p in all_h_params if p.ndim >= 2]
         lambda_params = [p for p in all_h_params if p.ndim < 2]
-        # shared_mlp lives outside transformer.h — include its params in matrix group
-        if self.shared_mlp is not None:
-            matrix_params += list(self.shared_mlp.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -588,11 +576,10 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        mlp = self.shared_mlp  # None if shared_ffn=False, shared MLP otherwise
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mlp=mlp)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
