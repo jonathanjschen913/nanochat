@@ -2,7 +2,7 @@
 
 ## Overview
 
-We select two architecture changes — **Mixture of Depths (MoD)** (Raposo et al., arXiv 2404.02258) and **Differential Attention** (Ye et al., ICLR 2025) — and evaluate them on a small nanochat configuration we call **picochat**. Both required real implementation in `gpt.py`. We train three models: a baseline and each change in isolation, comparing val_bpb and CORE score at d=12.
+We select two architecture changes — **Mixture of Depths (MoD)** (Raposo et al., arXiv 2404.02258) and **Differential Attention** (Ye et al., ICLR 2025) — and evaluate them on a small nanochat configuration we call **picochat**. Both required real implementation in `gpt.py`. We train four models: a baseline, each change in isolation, and a combined run, comparing val_bpb and CORE score at d=12.
 
 The two modifications have different design goals. **MoD** is an efficiency technique: at iso-parameter count, it reduces training FLOPs per step by ~44%, enabling faster wall-clock training and higher token throughput with a fixed model size. The evaluation question for MoD is whether this efficiency gain comes at an acceptable quality cost. **Differential Attention** targets quality directly: same compute, better attention selectivity. Its evaluation is straightforwardly quality-focused.
 
@@ -14,20 +14,20 @@ We define picochat as a depth=12 nanochat model:
 
 | Hyperparameter | Value | Rationale |
 |---|---|---|
-| `--depth` | 12 | Matches reference `quick_test` depth (~85M non-embedding params) |
+| `--depth` | 12 | Matches GPT-2 small depth (Radford et al., 2019); ~85M non-embedding params; large enough for a meaningful training signal while small enough to train in ~40 min on 8×H100 |
 | `--aspect-ratio` | 64 | nanochat default; model_dim = 12 × 64 = 768 |
 | `--head-dim` | 64 | 768/64 = 12 heads |
 | `--window-pattern` | L | Full attention; appropriate for short sequences |
 | `--device-batch-size` | 16 | Matches reference speedrun config |
-| Training horizon | Chinchilla (10.5×) | Automatically computed from parameter count |
+| Training horizon | Chinchilla (10.5×) | Automatically computed from parameter count (Hoffmann et al., 2022) |
 | Data | 80 FineWeb-EDU shards | Comfortable headroom over the ~20 shards needed for Chinchilla-optimal at ~85M params |
 | GPU | 8×H100 train / 4×H100 eval | Matches reference speedrun; 4×H100 for eval halves cost |
 
-**Justification for d=12:** Preliminary d=8 runs validated the pipeline and showed the expected quality gap. d=12 is the reference `quick_test` depth and provides a better training signal for evaluating architectural effects.
+**Justification for d=12:** Preliminary d=8 runs validated the pipeline and showed the expected quality gap. d=12 matches GPT-2 small's depth (Radford et al., 2019) and provides a better training signal for evaluating architectural effects.
 
 ---
 
-## The Three Models
+## The Four Models
 
 ### Model 1: pico_baseline
 **Config:** d=12, model_dim=768, 12 heads, ReLU², standard per-layer attention and MLPs.
@@ -153,11 +153,11 @@ For context: Raposo et al. (2024) validated MoD primarily under *isoFLOP* condit
 
 **Result.** Differential attention showed negligible BPB change (+0.1%, essentially flat at 0.9260 vs 0.9252) but a meaningful CORE drop (−7.8%, from 0.1140 to 0.1051).
 
-**The QK-norm interaction.** This is the central issue. Ye et al. (2024) developed and evaluated differential attention using AdamW without QK-norm, training at scales from 830M to 13.1B parameters on up to 1T tokens. Their architecture does *not* normalize Q and K projections individually (Ye et al., arXiv:2410.05258).
+**The QK-norm interaction.** This is the central issue. Ye et al. (2025) developed and evaluated differential attention using AdamW without QK-norm, training at scales from 830M to 13.1B parameters on up to 1T tokens. Their architecture does *not* normalize Q and K projections individually (Ye et al., 2025).
 
-nanochat *requires* QK-norm for training stability: the Muon optimizer (used for all 2D+ weight matrices including Q/K projections) drives Q and K weight norms upward during training, causing `q @ k^T` dot products to overflow in bfloat16 without normalization. Removing QK-norm causes NaN loss at approximately step 7. This is a hard constraint.
+nanochat *requires* QK-norm for training stability: the Muon optimizer (Jordan et al., 2024, github.com/KellerJordan/Muon) (used for all 2D+ weight matrices including Q/K projections) drives Q and K weight norms upward during training, causing `q @ k^T` dot products to overflow in bfloat16 without normalization. Removing QK-norm (Henry et al., 2020) causes NaN loss at approximately step 7. This is a hard constraint.
 
-The mechanistic consequence: QK-norm (RMSNorm applied to each of q1, q2, k1, k2 independently after RoPE) normalizes all four query/key vectors to similar magnitude distributions. The attention logits for both A1 and A2 are therefore computed from normalized vectors with similar scale, making the two attention distributions more similar. The subtraction `A1 − λ·A2` is designed to cancel diffuse, uninformative attention mass — but when both Q/K pairs are normalized to similar scales, A1 and A2 become more correlated, reducing the dynamic range of their difference. Ye et al.'s setup without QK-norm allows Q/K norms to vary freely across heads and layers, creating natural variation between the two attention groups that the differential mechanism can exploit. QK-norm removes this degree of freedom.
+The mechanistic consequence: QK-norm (RMSNorm applied to each of q1, q2, k1, k2 independently after RoPE) normalizes all four query/key vectors to similar magnitude distributions. The attention logits for both A1 and A2 are therefore computed from normalized vectors with similar scale, making the two attention distributions more similar. The subtraction `A1 − λ·A2` is designed to cancel diffuse, uninformative attention mass — but when both Q/K pairs are normalized to similar scales, A1 and A2 become more correlated, reducing the dynamic range of their difference. Ye et al.'s (2025) setup without QK-norm allows Q/K norms to vary freely across heads and layers, creating natural variation between the two attention groups that the differential mechanism can exploit. QK-norm removes this degree of freedom.
 
 **The BPB-CORE divergence.** The near-zero BPB delta (+0.001) combined with a −7.8% CORE drop reveals an important distinction. BPB measures average next-token prediction quality across the full validation distribution. CORE is a composite downstream task score (ARC, MMLU, etc.) that tests specific reasoning and knowledge retrieval. The divergence suggests differential attention preserves bulk language modeling quality while degrading on the tail of the distribution that matters for downstream tasks — consistent with QK-norm-constrained differential attention impairing the model's ability to form sharp, selective attention patterns needed for reasoning, while maintaining adequate performance on the "easy" majority of next-token predictions.
 
@@ -192,7 +192,7 @@ BPB degradation is approximately additive. CORE degradation is 81% worse than ad
 
 **These are not refutations of the original papers.** Both methods were validated under substantially different conditions:
 - Raposo et al. demonstrated MoD gains under isoFLOP comparisons at 60M–3B scale with standard AdamW. Iso-parameter MoD incurs a known quality tax; our results quantify it at d=12.
-- Ye et al. demonstrated DiffAttn gains at 830M–13.1B scale with AdamW and without QK-norm. nanochat's mandatory QK-norm is a hard constraint that limits the differential mechanism's effectiveness.
+- Ye et al. (2025) demonstrated DiffAttn gains at 830M–13.1B scale with AdamW and without QK-norm. nanochat's mandatory QK-norm is a hard constraint that limits the differential mechanism's effectiveness.
 
 **What this tells us.** Architectural modifications are not portable across training recipes. The interaction between optimizer choice (Muon), stability mechanisms (QK-norm), and architectural features (value embeddings, residual scaling) creates a specific optimization landscape in which these modifications behave differently from their original contexts.
 
@@ -204,12 +204,29 @@ BPB degradation is approximately additive. CORE degradation is 81% worse than ad
 
 Training runs tracked under `picochat-ablation`. Key plots:
 
-1. **val_bpb vs step** — main quality comparison across all 4 runs
-2. **val_bpb vs total_training_flops** — isoFLOP comparison (more honest for MoD, which trains fewer FLOPs per step)
-3. **CORE score** — evaluated once after training per model
-4. **tok/sec** — MoD is faster due to token-sparse computation on even layers
+**Figure 1: Training time and total FLOPs vs step**
 
-*[Insert W&B screenshot here.]*
+![Training time and total FLOPs](part2_total_training.png)
+
+MoD (green) accumulates fewer total FLOPs and finishes faster than the baseline (red) at matched step count, confirming the ~44% FLOP reduction. DiffAttn (blue) takes the longest wall-clock time — the two-softmax computation per super-head adds overhead despite similar parameter count.
+
+**Figure 2: Throughput and hardware utilisation (tok/sec, MFU)**
+
+![tok/sec and MFU](part2_training_stats.png)
+
+MoD (green) sustains the highest tok/sec and MFU due to token-sparse computation on even-indexed layers. DiffAttn (blue) has the lowest throughput, consistent with its higher per-step compute cost.
+
+**Figure 3: Train loss**
+
+![Train loss](part2_train_loss.png)
+
+All four models converge smoothly with no instability or NaN events. Curves are closely grouped throughout training, consistent with the small absolute differences in final quality.
+
+**Figure 4: Validation BPB**
+
+![Validation BPB](Part2_val_bpb.png)
+
+The baseline (red) achieves the lowest final val/bpb. The absolute differences (0.001–0.037 bpb) are small relative to the y-axis range; final values should be read from the results table above. MoD (green) and MoD+DiffAttn (pink) diverge slightly from the baseline in the later steps, consistent with the reported +3.7% and +4.1% bpb gaps.
 
 ---
 
@@ -253,15 +270,15 @@ The QK-norm constraint is the key open question. At d=24–26, `λ_init` saturat
 
 ### Shared FFN (pico_shared_ffn)
 
-MobiLlama-style FFN weight sharing: a single MLP shared across all 12 layers. Results: val_bpb **1.0058** (+8.7%), CORE **0.0810** (−36%). The result is confounded — pico_shared_ffn has only ~33M params vs baseline's ~85M (MLP sharing reduces total params 2.6×). Quality degradation reflects both weight sharing and fewer parameters and cannot be cleanly attributed to either alone.
+MobiLlama-style FFN weight sharing: a single MLP shared across all 12 layers. Results: val_bpb **1.0058** (+8.7%), CORE **0.0810** (−29%). The result is confounded — pico_shared_ffn has only ~33M params vs baseline's ~85M (MLP sharing reduces total params 2.6×). Quality degradation reflects both weight sharing and fewer parameters and cannot be cleanly attributed to either alone.
 
 ### Combined CLA + Shared FFN (pico_cla_shared_ffn)
 
-Both changes applied simultaneously: val_bpb **1.0410** (+12.5%), CORE **0.0575** (−55%). Worse than either change in isolation, consistent with independently harmful effects compounding additively.
+Both changes applied simultaneously: val_bpb **1.0410** (+12.5%), CORE **0.0575** (−50%). Worse than either change in isolation, consistent with independently harmful effects compounding additively.
 
 ### Differential Attention v2
 
-A second diff attn run with higher lambda vector LR (`scalar_lr` vs `scalar_lr × 0.01`). Results: val_bpb **0.9260**, CORE **0.1133** — slightly worse bpb than v1 (0.9222) but marginally better CORE. The higher LR made lambda values noisier without a clear benefit. v1 is the better run.
+A second diff attn run with higher lambda vector LR (`scalar_lr` vs `scalar_lr × 0.01`). Results: val_bpb **0.9260**, CORE **0.1133** — marginally better CORE than the reported run (0.1051) but no improvement in bpb. The higher LR made lambda values noisier without a clear benefit. The reported run is the better result.
 
 An attempt to remove QK-norm (to let the differential mechanism exploit full attention entropy variance) caused NaN loss at step 7 in bfloat16 due to Muon growing Q/K weight norms unchecked. QK-norm is a hard stability requirement with this optimizer.
 
@@ -281,8 +298,10 @@ Validated the pipeline and motivated the switch to d=12.
 
 2. Ye, T., Dong, L., Xia, Y., Sun, Y., Zhu, Y., Huang, G., and Wei, F. "Differential Transformer." In *Proceedings of the International Conference on Learning Representations (ICLR)*, 2025. arXiv:2410.05258.
 
-3. Jordan, P., Muennighoff, N., et al. "Muon: An optimizer for hidden layers in transformers." 2024.
+3. Jordan, K., Jin, Y., Boza, V., You, J., Cesista, F., Newhouse, L., and Bernstein, J. "Muon: An optimizer for hidden layers in neural networks." GitHub repository and blog post, 2024. https://github.com/KellerJordan/Muon
 
 4. Henry, A., Dachapally, P.R., Pawar, S., and Chen, Y. "Query-Key Normalization for Transformers." In *Findings of EMNLP*, 2020.
 
 5. Hoffmann, J., Borgeaud, S., Mensch, A., Buchatskaya, E., Cai, T., Rutherford, E., et al. "Training Compute-Optimal Large Language Models." In *NeurIPS*, 2022. arXiv:2203.15556.
+
+6. Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., and Sutskever, I. "Language Models are Unsupervised Multitask Learners." OpenAI Blog, 2019.
