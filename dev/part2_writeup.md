@@ -212,6 +212,10 @@ A second diff attn run with higher lambda vector LR (`scalar_lr` vs `scalar_lr Ã
 
 An attempt to remove QK-norm (to let the differential mechanism exploit full attention entropy variance) caused NaN loss at step 7 in bfloat16 due to Muon growing Q/K weight norms unchecked. QK-norm is a hard stability requirement with this optimizer.
 
+### Code cleanup
+
+After ablations were complete, SwiGLU and CLA were removed from `gpt.py` and `scripts/base_train.py` to keep the codebase focused on the two retained modifications (diff_attn and MoD). The removed flags are `--swiglu` and `--cla-sharing`. Existing checkpoints load correctly via `checkpoint_manager.py` backward-compatibility patches.
+
 ### d=8 Pilot Runs
 
 | Model | val_bpb | CORE |
