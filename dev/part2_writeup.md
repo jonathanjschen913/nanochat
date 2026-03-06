@@ -82,6 +82,17 @@ Both modifications applied simultaneously: even-indexed layers use MoD routing (
 
 ---
 
+## Code Changes
+
+All implementation changes are in the `part2` branch and can be reviewed in [Pull Request #1](../../pull/1).
+
+Key files modified:
+- **`nanochat/gpt.py`** — MoD router (`MoDRouter`), MoD routing logic in `Block.forward`, differential attention in `CausalSelfAttention` (halved heads, lambda parameters, `subln` RMSNorm, dual attention maps)
+- **`scripts/base_train.py`** — `--mod-routing`, `--mod-capacity`, `--differential-attn` flags wired into `GPTConfig`
+- **`runs/pico_ablation_modal.py`** — Modal cloud pipeline for all four ablation stages plus eval
+
+---
+
 ## Training Setup
 
 All models trained on Modal, 8×H100, 80 FineWeb-EDU shards, shared BPE tokenizer (2B chars). Tracked with Weights & Biases under `picochat-ablation`. Training horizon set automatically by Chinchilla ratio (`--target-param-data-ratio=10.5`).
