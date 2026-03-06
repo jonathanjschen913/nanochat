@@ -283,6 +283,8 @@ The 10/10 vs 0/10 gap is a clear emergent ability: basic world knowledge and fac
 
 *Pricing: Modal H100 on-demand (~$3.50/GPU/hr × 8 = $28/hr node, $14/hr for 4×H100). Actual cost exceeds GPU time × rate due to additional Modal charges for volume storage, container startup, and data transfer.*
 
+The developer's baseline nanochat (d=26, no diff_attn) trains in ~3 hrs at ~$84. Our diff_attn run took ~3.5 hrs at ~$120 — approximately 17% longer and ~$36 more expensive. This overhead comes from the two attention maps per layer (two flash_attn calls per block vs one). Combined with the +1.5% bpb penalty and −7.6% CORE drop, differential attention is a net negative at nanochat scale: it costs more to train and produces a worse model.
+
 ---
 
 ## References
