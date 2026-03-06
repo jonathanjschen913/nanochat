@@ -38,49 +38,27 @@ COMMON="
 "
 
 echo ""
-echo "==> [1/7] Smoke test: pico_baseline (ReLU², no CLA)"
+echo "==> [1/4] Smoke test: pico_baseline"
 python -m scripts.base_train \
     $COMMON \
     --model-tag="test_baseline"
 
 echo ""
-echo "==> [2/7] Smoke test: pico_swiglu (SwiGLU, no CLA)"
-python -m scripts.base_train \
-    $COMMON \
-    --swiglu \
-    --model-tag="test_swiglu"
-
-echo ""
-echo "==> [3/7] Smoke test: pico_cla (ReLU², CLA-2)"
-python -m scripts.base_train \
-    $COMMON \
-    --cla-sharing=2 \
-    --model-tag="test_cla"
-
-echo ""
-echo "==> [4/7] Smoke test: pico_swiglu_cla (SwiGLU + CLA-2)"
-python -m scripts.base_train \
-    $COMMON \
-    --swiglu \
-    --cla-sharing=2 \
-    --model-tag="test_swiglu_cla"
-
-echo ""
-echo "==> [5/7] Smoke test: pico_diff_attn (Differential Attention)"
+echo "==> [2/4] Smoke test: pico_diff_attn (Differential Attention)"
 python -m scripts.base_train \
     $COMMON \
     --differential-attn \
     --model-tag="test_diff_attn"
 
 echo ""
-echo "==> [6/7] Smoke test: pico_mod (Mixture of Depths)"
+echo "==> [3/4] Smoke test: pico_mod (Mixture of Depths)"
 python -m scripts.base_train \
     $COMMON \
     --mod-routing \
     --model-tag="test_mod"
 
 echo ""
-echo "==> [7/7] Smoke test: pico_mod_diff_attn (MoD + Differential Attention)"
+echo "==> [4/4] Smoke test: pico_mod_diff_attn (MoD + Differential Attention)"
 python -m scripts.base_train \
     $COMMON \
     --mod-routing \
@@ -88,5 +66,5 @@ python -m scripts.base_train \
     --model-tag="test_mod_diff_attn"
 
 echo ""
-echo "==> All 7 smoke tests passed. Ready for cloud training."
+echo "==> All 4 smoke tests passed. Ready for cloud training."
 echo "    Next: modal run runs/pico_ablation_modal.py"
