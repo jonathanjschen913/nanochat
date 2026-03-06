@@ -38,18 +38,17 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # SwiGLU: replace ReLU² MLP activation with SwiGLU (Shazeer 2020)
-    swiglu: bool = False
-    # CLA: cross-layer attention KV sharing factor (Brandon et al. 2024)
-    # 1 = disabled (every layer computes its own KV)
-    # 2 = CLA-2 (even layers reuse KV from the preceding odd layer)
-    cla_sharing: int = 1
     # FFN sharing: share one MLP across all transformer layers (MobiLlama, 2024)
     # When True, all blocks use the same MLP weights instead of per-layer MLPs
     shared_ffn: bool = False
     # Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)
     # Two softmax maps whose difference cancels attention noise, focusing on relevant tokens
     differential_attn: bool = False
+    # Mixture of Depths (Raposo et al., arXiv 2404.02258)
+    # Even-indexed layers route top mod_capacity fraction of tokens; odd layers are full-capacity.
+    # Incompatible with cla_sharing > 1. KV cache inference not supported.
+    mod_routing: bool = False
+    mod_capacity: float = 0.125  # top 12.5% of tokens pass through MoD layers (paper recommendation)
 
 
 def norm(x):
@@ -89,17 +88,11 @@ class CausalSelfAttention(nn.Module):
         assert self.n_embd % config.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
 
-        # CLA follower layers reuse K and V from the preceding leader layer.
-        # Not creating c_k/c_v avoids None gradients in the Muon optimizer.
-        self.is_cla_follower = config.cla_sharing > 1 and layer_idx % config.cla_sharing != 0
-
         if config.differential_attn:
             # Two Q groups per super-head (always needed)
             self.c_q = nn.Linear(self.n_embd, 2 * self.n_head * self.head_dim, bias=False)
-            # CLA followers reuse k/v from leader — don't create c_k, c_v
-            if not self.is_cla_follower:
-                self.c_k = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
-                self.c_v = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
             # Lambda scalars for differential weighting (learned, one per head_dim)
             self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim))
             self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim))
@@ -111,14 +104,13 @@ class CausalSelfAttention(nn.Module):
             self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
         else:
             self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-            if not self.is_cla_follower:
-                self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-                self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None, return_kv=False):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
         cos, sin = cos_sin
 
@@ -130,15 +122,9 @@ class CausalSelfAttention(nn.Module):
             q_full = self.c_q(x).view(B, T, self.n_head, 2, self.head_dim)
             q1, q2 = q_full[..., 0, :], q_full[..., 1, :]  # (B, T, n_head, head_dim) each
 
-            if shared_kv is not None:
-                # CLA follower: leader passed k as (B,T,n_kv_head,2*head_dim), v as same
-                k_flat, v = shared_kv
-                k1 = k_flat[..., :self.head_dim]   # (B, T, n_kv_head, head_dim)
-                k2 = k_flat[..., self.head_dim:]
-            else:
-                k_full = self.c_k(x).view(B, T, self.n_kv_head, 2, self.head_dim)
-                k1, k2 = k_full[..., 0, :], k_full[..., 1, :]
-                v = self.c_v(x).view(B, T, self.n_kv_head, 2 * self.head_dim)
+            k_full = self.c_k(x).view(B, T, self.n_kv_head, 2, self.head_dim)
+            k1, k2 = k_full[..., 0, :], k_full[..., 1, :]
+            v = self.c_v(x).view(B, T, self.n_kv_head, 2 * self.head_dim)
 
             # Value embedding (ve shape: (B, T, n_kv_head * 2 * head_dim))
             if ve is not None:
@@ -169,26 +155,16 @@ class CausalSelfAttention(nn.Module):
 
             y = y.contiguous().view(B, T, -1)  # (B, T, n_embd)
             y = self.c_proj(y)
-            if return_kv:
-                # Return k as flat (B,T,n_kv_head,2*head_dim) for CLA follower layers
-                k_flat = torch.cat([k1, k2], dim=-1)
-                return y, k_flat, v
             return y
 
         # --- Standard (non-differential) path ---
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-
-        if shared_kv is not None:
-            # CLA: reuse K and V from the previous layer instead of computing new ones
-            k, v = shared_kv
-        else:
-            k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-            v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
+        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        # Note: applied after CLA reuse so even CLA layers get per-layer value specialization
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
             gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head), range (0, 2)
@@ -220,35 +196,30 @@ class CausalSelfAttention(nn.Module):
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
-        if return_kv:
-            return y, k, v
         return y
 
 
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.swiglu = config.swiglu
-        if config.swiglu:
-            # SwiGLU: two projections of size 8/3 * n_embd, rounded to nearest multiple of 64
-            # This keeps parameter count approximately equal to the ReLU² MLP (4 * n_embd)
-            # because 2 * (8/3) ≈ 4 * (2/2) in terms of total projection parameters
-            hidden = round(config.n_embd * 8 / 3 / 64) * 64
-            self.c_gate = nn.Linear(config.n_embd, hidden * 2, bias=False)  # projects to [gate | value]
-            self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
-        else:
-            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
-        if self.swiglu:
-            x, gate = self.c_gate(x).chunk(2, dim=-1)
-            x = x * F.silu(gate)
-        else:
-            x = self.c_fc(x)
-            x = F.relu(x).square()
+        x = self.c_fc(x)
+        x = F.relu(x).square()
         x = self.c_proj(x)
         return x
+
+
+class MoDRouter(nn.Module):
+    """Scalar router for Mixture of Depths. Projects n_embd -> 1 (no bias)."""
+    def __init__(self, n_embd: int):
+        super().__init__()
+        self.proj = nn.Linear(n_embd, 1, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)  # (B, T, 1)
 
 
 class Block(nn.Module):
@@ -259,16 +230,64 @@ class Block(nn.Module):
         # is owned by GPT and passed in at forward time to avoid duplicate params.
         if not config.shared_ffn:
             self.mlp = MLP(config)
+        # MoD router on even-indexed layers only
+        self.mod_router = (
+            MoDRouter(config.n_embd)
+            if config.mod_routing and layer_idx % 2 == 0
+            else None
+        )
+        self._mod_capacity_frac = config.mod_capacity
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, shared_kv=None, return_kv=False, mlp=None):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, mlp=None):
         # mlp argument allows GPT to pass in the shared MLP when shared_ffn=True
         active_mlp = mlp if mlp is not None else self.mlp
-        if return_kv:
-            attn_out, k, v = self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv, return_kv=True)
-            x = x + attn_out
-            x = x + active_mlp(norm(x))
-            return x, k, v
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, shared_kv=shared_kv)
+
+        if self.mod_router is not None:
+            if kv_cache is not None:
+                raise NotImplementedError("KV cache inference not supported for MoD layers.")
+            B, T, D_embd = x.shape
+            capacity = max(1, int(self._mod_capacity_frac * T))
+
+            # 1. Router scores + top-k selection
+            router_weights = self.mod_router(x).squeeze(-1)          # (B, T)
+            _, top_indices = torch.topk(router_weights, capacity, dim=1)
+
+            # 2. Sort by original position for causal RoPE correctness
+            sorted_positions, _ = torch.sort(top_indices, dim=1)     # (B, capacity)
+
+            # 3. Gather selected tokens
+            gather_e = sorted_positions[:, :, None].expand(-1, -1, D_embd)
+            x_sel = x.gather(1, gather_e)                            # (B, capacity, D_embd)
+
+            # 4. Gather router weights at sorted positions
+            router_w_sel = router_weights.gather(1, sorted_positions).unsqueeze(-1)  # (B, capacity, 1)
+
+            # 5. Gather cos/sin at original positions
+            cos, sin = cos_sin
+            D2 = cos.size(-1)
+            gather_r = sorted_positions[:, :, None, None].expand(-1, -1, 1, D2)
+            cos_sel = cos.expand(B, -1, -1, -1).gather(1, gather_r)  # (B, capacity, 1, D2)
+            sin_sel = sin.expand(B, -1, -1, -1).gather(1, gather_r)
+
+            # 6. Gather value embeddings at selected positions (if present)
+            ve_sel = None
+            if ve is not None:
+                gather_v = sorted_positions[:, :, None].expand(-1, -1, ve.size(-1))
+                ve_sel = ve.gather(1, gather_v)
+
+            # 7. Run attention + MLP on compact tensor
+            x_out = x_sel + self.attn(norm(x_sel), ve_sel, (cos_sel, sin_sel),
+                                      window_size, kv_cache=None)
+            x_out = x_out + active_mlp(norm(x_out))
+
+            # 8. Weighted delta + scatter back
+            delta = x_out - x_sel
+            weighted_delta = router_w_sel * delta                    # (B, capacity, D_embd)
+            x = x.scatter_add(1, gather_e, weighted_delta)
+            return x
+
+        # --- Standard path (odd layers, or mod_routing=False) ---
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
         x = x + active_mlp(norm(x))
         return x
 
@@ -343,23 +362,16 @@ class GPT(nn.Module):
         s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
         for block in self.transformer.h:
             torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
-            if not block.attn.is_cla_follower:  # followers have no c_k, c_v (standard or diff_attn)
-                torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
-                torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
             if not self.config.shared_ffn:
-                if self.config.swiglu:
-                    torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
-                else:
-                    torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Shared FFN init (done once, not per-block)
         if self.config.shared_ffn:
-            if self.config.swiglu:
-                torch.nn.init.uniform_(self.shared_mlp.c_gate.weight, -s, s)
-            else:
-                torch.nn.init.uniform_(self.shared_mlp.c_fc.weight, -s, s)
+            torch.nn.init.uniform_(self.shared_mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(self.shared_mlp.c_proj.weight)
 
         # Per-layer scalars
@@ -374,6 +386,11 @@ class GPT(nn.Module):
         for block in self.transformer.h:
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
+
+        # MoD router: zero init so weighted_delta=0 at step 0 (MoD layers start as pure residuals)
+        for block in self.transformer.h:
+            if block.mod_router is not None:
+                torch.nn.init.zeros_(block.mod_router.proj.weight)
 
         # Differential attention lambda vectors: small normal init (per paper)
         if self.config.differential_attn:
@@ -463,9 +480,12 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for i, window_size in enumerate(self.window_sizes):
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
+            if self.config.mod_routing and i % 2 == 0:
+                effective_seq = max(1, int(self.config.mod_capacity * t))
+            else:
+                effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
@@ -568,22 +588,11 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        cla_sharing = self.config.cla_sharing
         mlp = self.shared_mlp  # None if shared_ffn=False, shared MLP otherwise
-        shared_kv = None  # holds (k, v) from leader layer for CLA follower layers
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            if cla_sharing > 1 and i % cla_sharing != 0:
-                # CLA follower: reuse K and V from the leader layer via local variable
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, shared_kv=shared_kv, mlp=mlp)
-            elif cla_sharing > 1:
-                # CLA leader: compute fresh K and V, return them explicitly for the next layer
-                x, k, v = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, return_kv=True, mlp=mlp)
-                shared_kv = (k, v)
-            else:
-                # CLA disabled: standard forward
-                x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mlp=mlp)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mlp=mlp)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

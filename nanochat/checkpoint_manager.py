@@ -29,6 +29,12 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "differential_attn" not in model_config_kwargs:
         model_config_kwargs["differential_attn"] = False
         log0(f"Patching missing differential_attn in model config to False")
+    if "mod_routing" not in model_config_kwargs:
+        model_config_kwargs["mod_routing"] = False
+        log0("Patching missing mod_routing in model config to False")
+    if "mod_capacity" not in model_config_kwargs:
+        model_config_kwargs["mod_capacity"] = 0.125
+        log0("Patching missing mod_capacity in model config to 0.125")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
