@@ -38,9 +38,6 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
-    # FFN sharing: share one MLP across all transformer layers (MobiLlama, 2024)
-    # When True, all blocks use the same MLP weights instead of per-layer MLPs
-    shared_ffn: bool = False
     # Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)
     # Two softmax maps whose difference cancels attention noise, focusing on relevant tokens
     differential_attn: bool = False
@@ -226,10 +223,7 @@ class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        # If shared_ffn is enabled, this block's mlp is unused — the shared MLP
-        # is owned by GPT and passed in at forward time to avoid duplicate params.
-        if not config.shared_ffn:
-            self.mlp = MLP(config)
+        self.mlp = MLP(config)
         # MoD router on even-indexed layers only
         self.mod_router = (
             MoDRouter(config.n_embd)
@@ -238,9 +232,8 @@ class Block(nn.Module):
         )
         self._mod_capacity_frac = config.mod_capacity
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache, mlp=None):
-        # mlp argument allows GPT to pass in the shared MLP when shared_ffn=True
-        active_mlp = mlp if mlp is not None else self.mlp
+    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        active_mlp = self.mlp
 
         if self.mod_router is not None:
             if kv_cache is not None:
@@ -313,9 +306,6 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, layer_idx) for layer_idx in range(config.n_layer)]),
         })
-        # Shared FFN (MobiLlama): one MLP owned here, passed to every block at forward time.
-        # Block.mlp is not created when shared_ffn=True, so no duplicate parameters.
-        self.shared_mlp = MLP(config) if config.shared_ffn else None
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
         # Per-layer learnable scalars (inspired by modded-nanogpt)
         # resid_lambdas: scales the residual stream at each layer (init 1.0 = neutral)
@@ -365,14 +355,8 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
-            if not self.config.shared_ffn:
-                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-                torch.nn.init.zeros_(block.mlp.c_proj.weight)
-
-        # Shared FFN init (done once, not per-block)
-        if self.config.shared_ffn:
-            torch.nn.init.uniform_(self.shared_mlp.c_fc.weight, -s, s)
-            torch.nn.init.zeros_(self.shared_mlp.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
 
         # Per-layer scalars
         self.resid_lambdas.fill_(1.0)   # 1.0 => typical residual connections at init
@@ -507,8 +491,6 @@ class GPT(nn.Module):
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        if self.shared_mlp is not None:
-            transformer_matrices += sum(p.numel() for p in self.shared_mlp.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
         total = wte + value_embeds + lm_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), "Parameter count mismatch"
@@ -530,9 +512,6 @@ class GPT(nn.Module):
         all_h_params = list(self.transformer.h.parameters())
         matrix_params = [p for p in all_h_params if p.ndim >= 2]
         lambda_params = [p for p in all_h_params if p.ndim < 2]
-        # shared_mlp lives outside transformer.h — include its params in matrix group
-        if self.shared_mlp is not None:
-            matrix_params += list(self.shared_mlp.parameters())
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
@@ -588,11 +567,10 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx) # embed current token
         x = norm(x)
         x0 = x  # save initial normalized embedding for x0 residual
-        mlp = self.shared_mlp  # None if shared_ffn=False, shared MLP otherwise
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache, mlp=mlp)
+            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
