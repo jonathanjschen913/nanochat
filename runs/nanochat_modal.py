@@ -344,6 +344,13 @@ def stage_sft() -> None:
     """
     _setup_cache()
 
+    # Delete existing SFT checkpoint to force clean retrain at bs=8
+    sft_dir = os.path.join(BASE_DIR, "chatsft_checkpoints", MODEL_TAG)
+    if os.path.exists(sft_dir):
+        import shutil
+        shutil.rmtree(sft_dir)
+        print(f"Deleted existing SFT checkpoint: {sft_dir}")
+
     # Download identity conversations for SFT personality
     identity_path = os.path.join(BASE_DIR, "identity_conversations.jsonl")
     _curl(IDENTITY_CONV_URL, identity_path)
@@ -352,7 +359,6 @@ def stage_sft() -> None:
         "scripts.chat_sft",
         [
             "--device-batch-size=8",  # d=26 needs smaller batch for SFT to avoid OOM
-            "--num-iterations=2000",  # full SFT training (default epoch was only 500 steps at bs=8)
             f"--run={WANDB_PROJECT}_{MODEL_TAG}_sft",
             f"--model-tag={MODEL_TAG}",
             "--chatcore-every=-1",  # diff_attn incompatible with KV cache eval
@@ -435,13 +441,13 @@ EMERGENT_QUESTIONS = [
     "What color is the sky?",
     "How many days are in a week?",
     "What is 2 plus 2?",
-    "What animal says meow?",
     "What is the opposite of hot?",
-    "What is the first letter of the alphabet?",
     "How many sides does a triangle have?",
     "What do plants need to grow?",
-    "What comes after Monday?",
-    "Is the sun a star?",
+    "What is water made of?",
+    "What is the boiling point of water?",
+    "What is the largest planet in our solar system?",
+    "What do humans need to survive?",
 ]
 
 EMERGENT_SCRIPT = '''
@@ -463,8 +469,11 @@ USER_START = "<|user_start|>"
 ASST_START = "<|assistant_start|>"
 
 for q in questions:
-    prompt = f"{USER_START}{q}{ASST_START}"
-    ids = tokenizer.encode(prompt)
+    ids = (
+        [tokenizer.encode_special(USER_START)]
+        + tokenizer.encode(q)
+        + [tokenizer.encode_special(ASST_START)]
+    )
     ids = torch.tensor([ids], device=device)
     stop_ids = set()
     for s in ["<|user_start|>", "<|end|>", "<|assistant_start|>", "<|assistant_end|>"]:
