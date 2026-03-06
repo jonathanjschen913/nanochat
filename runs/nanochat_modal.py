@@ -28,10 +28,10 @@ Cost reference (8×H100 at ~$28/hr, eval on 4×H100 at ~$14/hr)
     stage_data + tokenizer          : ~10 min    ~$5.30
     stage_pretrain_pico  d=12 diff_attn 8×H100: ~40 min    ~$18.70
     stage_sft_pico       d=12 diff_attn 8×H100: ~10 min    ~$4.70
-    stage_pretrain  d=26 8×H100     : ~3 hrs     ~$84.00
+    stage_pretrain  d=26 8×H100     : ~3.5 hrs   ~$120.00
     stage_sft       d=26 8×H100     : ~30 min    ~$14.00
     stage_eval      bpb+CORE 4×H100 : ~30 min    ~$7.00
-    Total                                        ~$134
+    Total                                        ~$141
 """
 
 import os
@@ -535,11 +535,11 @@ def main() -> None:
     Full Part 4 pipeline:
         0. Download 370 FineWeb-EDU shards      (CPU,    ~20 min,  ~$0.50)
         1. Train BPE tokenizer                  (1×H100, ~2 min,   ~$0.12)
-        2. Pretrain nanochat d=26 + DiffAttn    (8×H100, ~3 hrs,   ~$84.00)
+        2. Pretrain nanochat d=26 + DiffAttn    (8×H100, ~3.5 hrs, ~$120.00)
         3. SFT fine-tuning                      (8×H100, ~30 min,  ~$14.00)
         4. Eval (bpb + CORE)                    (4×H100, ~30 min,  ~$7.00)
 
-    Estimated total: ~$105-110 at H100 on-demand pricing (~$3.50/GPU/hr).
+    Estimated total: ~$141 at H100 on-demand pricing (~$3.50/GPU/hr).
     """
     w = 64
     print("\n" + "=" * w)

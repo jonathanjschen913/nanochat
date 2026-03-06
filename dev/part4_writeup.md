@@ -276,12 +276,12 @@ The 10/10 vs 0/10 gap is a clear emergent ability: basic world knowledge and fac
 
 | Item | Time | GPUs | Cost |
 |---|---|---|---|
-| nanochat + diff attn pretrain (d=26) | ~3 hrs | 8×H100 | ~$84 |
+| nanochat + diff attn pretrain (d=26) | ~3.5 hrs | 8×H100 | ~$120 |
 | SFT fine-tuning | ~30 min | 8×H100 | ~$14 |
 | Eval (bpb + CORE) | ~30 min | 4×H100 | ~$7 |
-| **Total** | **~4 hrs** | | **~$105** |
+| **Total** | **~4 hrs** | | **~$141** |
 
-*Pricing: Modal H100 on-demand ~$3.50/GPU/hr.*
+*Pricing: Modal H100 on-demand (~$3.50/GPU/hr × 8 = $28/hr node, $14/hr for 4×H100). Actual cost exceeds GPU time × rate due to additional Modal charges for volume storage, container startup, and data transfer.*
 
 ---
 
