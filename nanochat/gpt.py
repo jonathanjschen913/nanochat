@@ -97,8 +97,6 @@ class CausalSelfAttention(nn.Module):
             self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim))
             # Fixed init scalar (not learned): lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
             self.lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
-            # Per-head RMSNorm over 2*head_dim, no learnable params
-            self.subln = nn.RMSNorm(2 * self.head_dim, eps=1e-5, elementwise_affine=False)
         else:
             self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
             self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
@@ -121,13 +119,18 @@ class CausalSelfAttention(nn.Module):
 
             k_full = self.c_k(x).view(B, T, self.n_kv_head, 2, self.head_dim)
             k1, k2 = k_full[..., 0, :], k_full[..., 1, :]
-            v = self.c_v(x).view(B, T, self.n_kv_head, 2 * self.head_dim)
+            # V is projected to 2*head_dim and split into v1, v2 (each head_dim).
+            # This avoids passing D_v != D_q to SDPA, which produces incorrect output
+            # shapes in torch.compile on MPS (MPS SDPA assumes D_out == D_q).
+            v_full = self.c_v(x).view(B, T, self.n_kv_head, 2, self.head_dim)
+            v1, v2 = v_full[..., 0, :], v_full[..., 1, :]  # (B, T, n_kv_head, head_dim) each
 
-            # Value embedding (ve shape: (B, T, n_kv_head * 2 * head_dim))
+            # Value embedding applied to v1 and v2 separately
             if ve is not None:
-                ve = ve.view(B, T, self.n_kv_head, 2 * self.head_dim)
+                ve_split = ve.view(B, T, self.n_kv_head, 2, self.head_dim)
                 gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
-                v = v + gate.unsqueeze(-1) * ve
+                v1 = v1 + gate.unsqueeze(-1) * ve_split[..., 0, :]
+                v2 = v2 + gate.unsqueeze(-1) * ve_split[..., 1, :]
 
             # RoPE + QK-norm for all four groups.
             # QK-norm is required for training stability with Muon: without it,
@@ -142,13 +145,19 @@ class CausalSelfAttention(nn.Module):
                    - torch.dot(self.lambda_q2, self.lambda_k2).clamp(-10, 10).exp()
                    + self.lambda_init)
 
-            # Two attention maps over the same V (shape: (B, T, n_head, 2*head_dim))
-            A1 = flash_attn.flash_attn_func(q1, k1, v, causal=True, window_size=window_size)
-            A2 = flash_attn.flash_attn_func(q2, k2, v, causal=True, window_size=window_size)
-            y = A1 - lam * A2  # (B, T, n_head, 2*head_dim)
+            # Batch q1/q2 and k1/k2 into 2B so each v-half needs only one attention call.
+            # By linearity: attn(q,k,cat(v1,v2)) = cat(attn(q,k,v1), attn(q,k,v2))
+            q_cat = torch.cat([q1, q2], dim=0)   # (2B, T, n_head, head_dim)
+            k_cat = torch.cat([k1, k2], dim=0)   # (2B, T, n_kv_head, head_dim)
+            v1_rep = torch.cat([v1, v1], dim=0)  # (2B, T, n_kv_head, head_dim)
+            v2_rep = torch.cat([v2, v2], dim=0)  # (2B, T, n_kv_head, head_dim)
+            Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
+            Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+            # Split back and compute differential subtraction per v-half
+            y = torch.cat([Ap1[:B] - lam * Ap1[B:], Ap2[:B] - lam * Ap2[B:]], dim=-1)  # (B, T, n_head, 2*head_dim)
 
             # Per-head RMSNorm scaled by (1 - lambda_init)
-            y = self.subln(y) * (1 - self.lambda_init)
+            y = F.rms_norm(y, (2 * self.head_dim,)) * (1 - self.lambda_init)
 
             y = y.contiguous().view(B, T, -1)  # (B, T, n_embd)
             y = self.c_proj(y)
