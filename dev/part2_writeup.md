@@ -82,6 +82,17 @@ Both modifications applied simultaneously: even-indexed layers use MoD routing (
 
 ---
 
+## Code Changes
+
+All implementation changes are in the `part2` branch and can be reviewed in [Pull Request #1](../../pull/1).
+
+Key files modified:
+- **`nanochat/gpt.py`** — MoD router (`MoDRouter`), MoD routing logic in `Block.forward`, differential attention in `CausalSelfAttention` (halved heads, lambda parameters, `subln` RMSNorm, dual attention maps)
+- **`scripts/base_train.py`** — `--mod-routing`, `--mod-capacity`, `--differential-attn` flags wired into `GPTConfig`
+- **`runs/pico_ablation_modal.py`** — Modal cloud pipeline for all four ablation stages plus eval
+
+---
+
 ## Training Setup
 
 All models trained on Modal, 8×H100, 80 FineWeb-EDU shards, shared BPE tokenizer (2B chars). Tracked with Weights & Biases under `picochat-ablation`. Training horizon set automatically by Chinchilla ratio (`--target-param-data-ratio=10.5`).
@@ -211,6 +222,10 @@ Both changes applied simultaneously: val_bpb **1.0410** (+12.5%), CORE **0.0575*
 A second diff attn run with higher lambda vector LR (`scalar_lr` vs `scalar_lr × 0.01`). Results: val_bpb **0.9260**, CORE **0.1133** — marginally better CORE than the reported run (0.1051) but no improvement in bpb. The higher LR made lambda values noisier without a clear benefit. The reported run is the better result.
 
 An attempt to remove QK-norm (to let the differential mechanism exploit full attention entropy variance) caused NaN loss at step 7 in bfloat16 due to Muon growing Q/K weight norms unchecked. QK-norm is a hard stability requirement with this optimizer.
+
+### Code cleanup
+
+After ablations were complete, SwiGLU and CLA were removed from `gpt.py` and `scripts/base_train.py` to keep the codebase focused on the two retained modifications (diff_attn and MoD). The removed flags are `--swiglu` and `--cla-sharing`. Existing checkpoints load correctly via `checkpoint_manager.py` backward-compatibility patches.
 
 ### d=8 Pilot Runs
 
