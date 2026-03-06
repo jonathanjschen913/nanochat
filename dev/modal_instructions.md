@@ -60,7 +60,7 @@ modal secret create nanochat-secrets \
 ## Before Running on Modal: Local Smoke Test
 
 Always run the local smoke test first to catch code errors before spending credits.
-This runs all 4 configs at tiny scale (~3-5 min, free):
+This runs all configs at tiny scale (~3-5 min, free):
 
 ```bash
 # From the nanochat repo root, with the nanochat venv active
@@ -69,12 +69,12 @@ bash runs/runpico_test.sh
 deactivate
 ```
 
-You should see all 4 configs complete without errors:
+You should see all configs complete without errors:
 ```
-==> [1/4] Smoke test: pico_baseline (ReLU², no CLA)    ✓
-==> [2/4] Smoke test: pico_swiglu (SwiGLU, no CLA)     ✓
-==> [3/4] Smoke test: pico_cla (ReLU², CLA-2)          ✓
-==> [4/4] Smoke test: pico_swiglu_cla (SwiGLU + CLA-2) ✓
+==> [1/4] Smoke test: pico_baseline          ✓
+==> [2/4] Smoke test: pico_diff_attn         ✓
+==> [3/4] Smoke test: pico_mod               ✓
+==> [4/4] Smoke test: pico_mod_diff_attn     ✓
 ```
 
 ---
@@ -99,7 +99,7 @@ modal run runs/pico_ablation_modal.py::stage_tokenizer
 
 If both pass without errors, the container image, volume, and secrets are all working correctly.
 
-### Full ablation (~2.5 hours, ~$34)
+### Full ablation (~2.5 hours, ~$108)
 
 ```bash
 modal run runs/pico_ablation_modal.py
@@ -107,13 +107,13 @@ modal run runs/pico_ablation_modal.py
 
 This runs all stages in order:
 ```
-[0/5] Download 40 FineWeb-EDU shards     CPU       ~5 min
-[1/5] Train BPE tokenizer               1×H100    ~2 min
-[2a/5] Pretrain pico_baseline           8×H100    ~10 min   ~$5
-[2b/5] Pretrain pico_swiglu             8×H100    ~10 min   ~$5
-[2c/5] Pretrain pico_cla                8×H100    ~10 min   ~$5
-[2d/5] Pretrain pico_swiglu_cla         8×H100    ~10 min   ~$5
-[3/5] Eval all 4 models (bpb+CORE)     4×H100    ~120 min  ~$9
+[0/5] Download 80 FineWeb-EDU shards        CPU       ~10 min
+[1/5] Train BPE tokenizer                  1×H100    ~2 min
+[2a/5] Pretrain pico_baseline              8×H100    ~40 min   ~$18.70
+[2b/5] Pretrain pico_mod                   8×H100    ~40 min   ~$18.70
+[2c/5] Pretrain pico_diff_attn             8×H100    ~40 min   ~$18.70
+[2d/5] Pretrain pico_mod_diff_attn         8×H100    ~40 min   ~$18.70
+[3/5] Eval all 4 models (bpb+CORE)        4×H100    ~120 min  ~$28.00
 ```
 
 ### Run individual stages
@@ -124,9 +124,9 @@ If a stage fails or you want to re-run one step:
 modal run runs/pico_ablation_modal.py::stage_data
 modal run runs/pico_ablation_modal.py::stage_tokenizer
 modal run runs/pico_ablation_modal.py::stage_pretrain_baseline
-modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu
-modal run runs/pico_ablation_modal.py::stage_pretrain_cla
-modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu_cla
+modal run runs/pico_ablation_modal.py::stage_pretrain_mod
+modal run runs/pico_ablation_modal.py::stage_pretrain_diff_attn
+modal run runs/pico_ablation_modal.py::stage_pretrain_mod_diff_attn
 modal run runs/pico_ablation_modal.py::stage_eval
 ```
 
@@ -147,11 +147,11 @@ Monitor spend at: https://modal.com/settings/billing
 Approximate costs per stage at H100 on-demand pricing (~$3.50/GPU/hr):
 | Stage | GPUs | Time | Cost |
 |---|---|---|---|
-| stage_data | CPU | ~5 min | ~$0.10 |
+| stage_data | CPU | ~10 min | ~$0.10 |
 | stage_tokenizer | 1×H100 | ~2 min | ~$0.12 |
-| stage_pretrain_* (each) | 8×H100 | ~10 min | ~$4.70 |
-| stage_eval | 4×H100 | ~120 min | ~$9.30 |
-| **Total** | | **~2.5 hrs** | **~$34** |
+| stage_pretrain_* (each) | 8×H100 | ~40 min | ~$18.70 |
+| stage_eval | 4×H100 | ~120 min | ~$28.00 |
+| **Total** | | **~4.5 hrs** | **~$108** |
 
 ### W&B training curves
 If you set a real `WANDB_API_KEY`, training metrics are logged to:
@@ -165,12 +165,12 @@ At the end of `stage_eval`, a summary table is printed to the terminal:
 ============================================================
   PICOCHAT ABLATION RESULTS
 ============================================================
-Model                val_bpb       CORE
+Model                    val_bpb       CORE
 ------------------------------------------------------------
-pico_baseline        X.XXX         X.XXX
-pico_swiglu          X.XXX         X.XXX
-pico_cla             X.XXX         X.XXX
-pico_swiglu_cla      X.XXX         X.XXX
+pico_baseline            X.XXX         X.XXX
+pico_mod                 X.XXX         X.XXX
+pico_diff_attn           X.XXX         X.XXX
+pico_mod_diff_attn       X.XXX         X.XXX
 ============================================================
 GPT-2 CORE threshold: 0.256525
 ```
@@ -197,7 +197,7 @@ Run the secret creation command from the Prerequisites section.
 ### Stage fails mid-run
 Re-run just the failed stage — all prior work is saved to the Modal Volume:
 ```bash
-modal run runs/pico_ablation_modal.py::stage_pretrain_swiglu
+modal run runs/pico_ablation_modal.py::stage_pretrain_diff_attn
 ```
 
 ### Container image rebuild taking too long
