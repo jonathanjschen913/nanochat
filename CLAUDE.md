@@ -152,35 +152,60 @@ Step 5: Run combo SFT (baseline + top 2)                      ← TODO
 Step 6: Run eval on combo checkpoint                          ← TODO
 ```
 
-**Current status** (as of 2026-03-11):
-- Step 1 launched as 4 detached Modal apps (all writing to separate dirs on `nanochat-vol`):
-  - `stage_sft_baseline` → `chatsft_checkpoints/sft_baseline`
-  - `stage_sft_metamathqa` → `chatsft_checkpoints/sft_metamathqa`
-  - `stage_sft_orcamath` → `chatsft_checkpoints/sft_orcamath`
-  - `stage_sft_dartmath` → `chatsft_checkpoints/sft_dartmath`
-- Check status: `PYTHONUTF8=1 modal app list`
-- All smoke tests passed locally (8/8)
+### Part 2 — Operational Runbook
 
-**Modal commands**:
+**Checking status:**
 ```bash
-# Step 1 — already launched (detached, survives terminal close):
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_baseline
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_metamathqa
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_orcamath
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_dartmath
+# List all Modal apps — look for "ephemeral (detached)" = running, "stopped" = finished or failed
+PYTHONUTF8=1 modal app list
+```
 
-# Step 2 — run after all 4 SFT jobs finish:
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_eval
+**Identifying which app is which stage:**
+Modal app IDs don't encode the stage name. To identify a stopped app:
+```bash
+PYTHONUTF8=1 modal app logs <app-id> 2>&1 | grep "sft_tag\|sft_baseline\|sft_meta\|sft_orca\|sft_dart" | head -5
+```
 
-# Steps 4–5 — after reviewing eval results, edit combo flags in stage_sft_combo() then:
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_combo
+**Investigating failures:**
+A "stopped" app could be success or failure. Check logs:
+```bash
+# Quick error scan:
+PYTHONUTF8=1 modal app logs <app-id> 2>&1 | grep -i "error\|exception\|assert\|OOM" | head -20
+# Full tail:
+PYTHONUTF8=1 modal app logs <app-id> 2>&1 | tail -50
+```
 
-# Step 6 — eval the combo checkpoint:
+**Verifying success:**
+A successful SFT run will show "SFT complete: sft_<tag>" near the end of logs. It writes a checkpoint to `chatsft_checkpoints/<sft_tag>/` on the `nanochat-vol` Modal volume.
+
+**Relaunching a failed stage:**
+Fix the bug locally, commit, push, then relaunch:
+```bash
+PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_<name>
+```
+The stage will delete any existing partial checkpoint before retraining (see `_run_sft()` in `part2_sft_modal.py`).
+
+**Known issues (already fixed in this branch):**
+- `swiglu` key in old checkpoints → fixed in `checkpoint_manager.py` (strips unknown config keys)
+- MetaMathQA has 4 rows with empty `query` field → fixed in `tasks/metamathqa.py` (`.filter()` before `.shuffle()`)
+- Windows `charmap` encoding errors → always prefix commands with `PYTHONUTF8=1`
+
+**When all 4 SFT runs succeed → proceed to Step 2:**
+```bash
 PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_eval
 ```
+This evaluates all checkpoints found in `chatsft_checkpoints/` on the volume. Results go to W&B (`nanochat-part2` project) and stdout logs.
+
+**After eval → Step 3–6:**
+1. Read eval logs or W&B to compare GSM8K scores across sft_baseline, sft_metamathqa, sft_orcamath, sft_dartmath
+2. Pick the top 2 math datasets
+3. Edit `stage_sft_combo()` in `runs/part2_sft_modal.py` — change the flags list to the winning two
+4. Run combo: `PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_combo`
+5. Run eval again: `PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_eval`
 
 ### Windows Development Notes
 
 - Set `PYTHONUTF8=1` before all `modal` and `python` commands (Windows charmap encoding issues)
 - `torch.compile` fails on Windows CPU (no `cl` compiler) — use `TORCH_COMPILE_DISABLE=1` for local testing
 - Need ≥2 data shards for local pretrain (train split = `parquet_files[:-1]`, so 1 shard = empty train set)
+- Local smoke tests: test task loading, tokenizer rendering, and `generate_batch_no_cache` — see commit history for the 8 test patterns
