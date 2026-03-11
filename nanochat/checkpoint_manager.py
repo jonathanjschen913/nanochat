@@ -103,6 +103,12 @@ def build_model(checkpoint_dir, step, device, phase):
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
     _patch_missing_config_keys(model_config_kwargs)
+    # Strip unknown keys that may exist in old checkpoints (e.g. 'swiglu')
+    known_fields = {f.name for f in __import__('dataclasses').fields(GPTConfig)}
+    unknown_keys = set(model_config_kwargs) - known_fields
+    if unknown_keys:
+        log0(f"Stripping unknown config keys from checkpoint: {unknown_keys}")
+        model_config_kwargs = {k: v for k, v in model_config_kwargs.items() if k in known_fields}
     log0(f"Building model with config: {model_config_kwargs}")
     model_config = GPTConfig(**model_config_kwargs)
     _patch_missing_keys(model_data, model_config)
