@@ -288,17 +288,27 @@ def stage_sft_combo() -> None:
     gpu=GPU_EVAL,
     timeout=EVAL_TIMEOUT_SEC,
 )
-def stage_eval() -> None:
+def stage_eval(tags: str = "") -> None:
     """
-    Evaluate all SFT checkpoints on ChatCORE tasks.
+    Evaluate SFT checkpoints on ChatCORE tasks.
     Uses cache-free generation for generative tasks (diff_attn).
+
+    Args:
+        tags: Comma-separated list of sft tags to evaluate (e.g. "sft_combo,sft_baseline").
+              If empty, evaluates all available checkpoints.
     """
     _setup_cache()
+
+    # Determine which tags to look for
+    if tags:
+        requested_tags = [t.strip() for t in tags.split(",") if t.strip()]
+    else:
+        requested_tags = list(SFT_TAGS.values())
 
     # Find which SFT checkpoints exist
     chatsft_dir = os.path.join(BASE_DIR, "chatsft_checkpoints")
     available_tags = []
-    for tag in SFT_TAGS.values():
+    for tag in requested_tags:
         tag_dir = os.path.join(chatsft_dir, tag)
         if os.path.isdir(tag_dir):
             available_tags.append(tag)

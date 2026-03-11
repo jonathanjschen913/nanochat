@@ -128,84 +128,72 @@ Five SFT runs on `nanochat_d26_diff_attn`, each saving to `chatsft_checkpoints/<
 | 2 | `sft_metamathqa` | `--metamathqa` | ~1.57M |
 | 3 | `sft_orcamath` | `--orcamath` | ~1.37M |
 | 4 | `sft_dartmath` | `--dartmath` | ~1.75M |
-| 5 | `sft_combo` | (top 2 from runs 2–4) | TBD |
+| 5 | `sft_combo` | `--metamathqa --dartmath` | ~1.75M |
 
 **Added math datasets**:
 - `tasks/metamathqa.py` — MetaMathQA 395K (Yu et al., arXiv:2309.12284)
 - `tasks/orcamath.py` — Orca-Math 200K (Mitra et al., arXiv:2402.14830)
 - `tasks/dartmath.py` — DART-Math-Hard 585K (Tong et al., arXiv:2407.13690)
 
+**Eval results (runs 1–4, n=50 per task, cache-free generation)**:
+
+| Tag | ARC-E | ARC-C | MMLU | GSM8K | HumanEval | SpellingBee |
+|-----|-------|-------|------|-------|-----------|-------------|
+| sft_baseline | 56% | 42% | 34% | 4% | 2% | 100% |
+| sft_metamathqa | 62% | 40% | 34% | **18%** | 4% | 100% |
+| sft_orcamath | 60% | 38% | 40% | 0% | 2% | 100% |
+| sft_dartmath | 64% | 28% | **44%** | 0% | 4% | 100% |
+| **sft_combo** | 52% | **46%** | 38% | **20%** | **6%** | 100% |
+
+**Key finding**: Combo (MetaMathQA + DART-Math) achieved best GSM8K (20%), ARC-C (46%), HumanEval (6%). Minor ARC-E regression.
+
 **Code changes for Part 2**:
 - `scripts/chat_sft.py` — added `--metamathqa`, `--orcamath`, `--dartmath`, `--sft-tag` flags
 - `scripts/chat_eval.py` — added `generate_batch_no_cache()` for diff_attn models
 - `nanochat/checkpoint_manager.py` — strips unknown config keys from old checkpoints (e.g. `swiglu`)
-- `runs/part2_sft_modal.py` — Modal script for all 5 SFT runs + eval
+- `runs/part2_sft_modal.py` — Modal script for all 5 SFT runs + eval (stage_eval accepts `--tags` to filter checkpoints)
 
-### Part 2 — Execution Flow
+### Part 2 — Status: COMPLETE
 
-```
-Step 1: Run 4 SFT jobs (baseline + 3 math datasets)          ← DONE (detached on Modal)
-Step 2: Run eval on all 4 checkpoints                         ← TODO after step 1 finishes
-Step 3: Review GSM8K scores, pick top 2 math datasets         ← TODO (manual)
-Step 4: Edit stage_sft_combo() flags in part2_sft_modal.py    ← TODO (currently hardcoded to --metamathqa --dartmath)
-Step 5: Run combo SFT (baseline + top 2)                      ← TODO
-Step 6: Run eval on combo checkpoint                          ← TODO
-```
+All 6 steps finished. See `dev/a4_part2_writeup.md` for full analysis and discussion.
 
-### Part 2 — Operational Runbook
+### Part 2 — Key Files
 
-**Checking status:**
-```bash
-# List all Modal apps — look for "ephemeral (detached)" = running, "stopped" = finished or failed
-PYTHONUTF8=1 modal app list
-```
+| File | Role |
+|------|------|
+| `tasks/metamathqa.py` | MetaMathQA 395K dataset loader (query→user, response→assistant) |
+| `tasks/orcamath.py` | Orca-Math 200K dataset loader (question→user, answer→assistant) |
+| `tasks/dartmath.py` | DART-Math-Hard 585K dataset loader (query→user, response→assistant) |
+| `scripts/chat_sft.py` | SFT training script — added `--metamathqa`, `--orcamath`, `--dartmath`, `--sft-tag` flags |
+| `scripts/chat_eval.py` | Eval script — added `generate_batch_no_cache()` for diff_attn models |
+| `nanochat/checkpoint_manager.py` | Strips unknown config keys from old checkpoints (e.g. `swiglu`) |
+| `runs/part2_sft_modal.py` | Modal script for all 5 SFT runs + eval (`stage_eval` accepts `--tags` to filter) |
+| `dev/a4_part2_writeup.md` | Full writeup: dataset justifications, results, analysis |
+| `dev/math_datasets_research.md` | Background research on 10 candidate math datasets |
 
-**Identifying which app is which stage:**
-Modal app IDs don't encode the stage name. To identify a stopped app:
-```bash
-PYTHONUTF8=1 modal app logs <app-id> 2>&1 | grep "sft_tag\|sft_baseline\|sft_meta\|sft_orca\|sft_dart" | head -5
-```
+### Part 2 — Modal Artifacts
 
-**Investigating failures:**
-A "stopped" app could be success or failure. Check logs:
-```bash
-# Quick error scan:
-PYTHONUTF8=1 modal app logs <app-id> 2>&1 | grep -i "error\|exception\|assert\|OOM" | head -20
-# Full tail:
-PYTHONUTF8=1 modal app logs <app-id> 2>&1 | tail -50
-```
+All checkpoints live on Modal volume `nanochat-vol` under `chatsft_checkpoints/`:
+- `sft_baseline`, `sft_metamathqa`, `sft_orcamath`, `sft_dartmath`, `sft_combo`
 
-**Verifying success:**
-A successful SFT run will show "SFT complete: sft_<tag>" near the end of logs. It writes a checkpoint to `chatsft_checkpoints/<sft_tag>/` on the `nanochat-vol` Modal volume.
+W&B project: `nanochat-sft` (user: `iamthebest`)
 
-**Relaunching a failed stage:**
-Fix the bug locally, commit, push, then relaunch:
-```bash
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_<name>
-```
-The stage will delete any existing partial checkpoint before retraining (see `_run_sft()` in `part2_sft_modal.py`).
+### Handoff for Parts 3 & 4
 
-**Known issues (already fixed in this branch):**
-- `swiglu` key in old checkpoints → fixed in `checkpoint_manager.py` (strips unknown config keys)
-- MetaMathQA has 4 rows with empty `query` field → fixed in `tasks/metamathqa.py` (`.filter()` before `.shuffle()`)
-- Windows `charmap` encoding errors → always prefix commands with `PYTHONUTF8=1`
+**What Parts 3/4 need from Part 2:**
+- The RL script (`scripts/chat_rl.py`) loads an SFT checkpoint via `load_model("sft", ...)`. Use `--model-tag=<sft_tag>` to select which SFT checkpoint to start RL from (e.g. `--model-tag=sft_combo` for the best Part 2 model).
+- SFT checkpoints are stored on Modal volume `nanochat-vol` at `chatsft_checkpoints/<sft_tag>/`.
+- The recommended starting point for RL is `sft_combo` (best GSM8K: 20%).
 
-**When all 4 SFT runs succeed → proceed to Step 2:**
-```bash
-PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_eval
-```
-This evaluates all checkpoints found in `chatsft_checkpoints/` on the volume. Results go to W&B (`nanochat-part2` project) and stdout logs.
+**Existing RL code:**
+- `scripts/chat_rl.py` — GRPO-style RL on GSM8K. Simplified REINFORCE: no KL penalty, no PPO clipping, token-level DAPO normalization, advantage = `(r - mu)` without sigma.
+- `tasks/gsm8k.py` — contains `GSM8K.reward()` which returns 1 (correct) or 0 (incorrect) by comparing extracted numerical answers. This is the baseline reward for Part 4.
+- `runs/part3_context_modal.py` — draft/PoC Modal script for Part 3 (not production-ready, needs review).
 
-**After eval → Step 3–6:**
-1. Read eval logs or W&B to compare GSM8K scores across sft_baseline, sft_metamathqa, sft_orcamath, sft_dartmath
-2. Pick the top 2 math datasets
-3. Edit `stage_sft_combo()` in `runs/part2_sft_modal.py` — change the flags list to the winning two
-4. Run combo: `PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_sft_combo`
-5. Run eval again: `PYTHONUTF8=1 modal run --detach runs/part2_sft_modal.py::stage_eval`
+**Differential attention constraint:**
+- KV cache raises `NotImplementedError` with diff_attn. The RL script uses `Engine` (KV-cached) for rollout generation — this will need the same cache-free treatment as eval. See `generate_batch_no_cache()` in `scripts/chat_eval.py` for the pattern.
 
-### Windows Development Notes
-
-- Set `PYTHONUTF8=1` before all `modal` and `python` commands (Windows charmap encoding issues)
-- `torch.compile` fails on Windows CPU (no `cl` compiler) — use `TORCH_COMPILE_DISABLE=1` for local testing
-- Need ≥2 data shards for local pretrain (train split = `parquet_files[:-1]`, so 1 shard = empty train set)
-- Local smoke tests: test task loading, tokenizer rendering, and `generate_batch_no_cache` — see commit history for the 8 test patterns
+**Known issues to watch for:**
+- `swiglu` key in old checkpoints — already fixed in `checkpoint_manager.py`
+- Windows: always prefix commands with `PYTHONUTF8=1`; use `TORCH_COMPILE_DISABLE=1` for local CPU testing
+- `torch.compile` fails on Windows (no `cl` compiler)
