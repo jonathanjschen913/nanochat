@@ -188,10 +188,17 @@ W&B project: `nanochat-sft` (user: `iamthebest`)
 **Existing RL code:**
 - `scripts/chat_rl.py` — GRPO-style RL on GSM8K. Simplified REINFORCE: no KL penalty, no PPO clipping, token-level DAPO normalization, advantage = `(r - mu)` without sigma.
 - `tasks/gsm8k.py` — contains `GSM8K.reward()` which returns 1 (correct) or 0 (incorrect) by comparing extracted numerical answers. This is the baseline reward for Part 4.
-- `runs/part3_context_modal.py` — draft/PoC Modal script for Part 3 (not production-ready, needs review).
+- `runs/part3_rl_modal.py` — Modal script for Part 3 RL run. Stages: `stage_rl_baseline`, `stage_collect_completions`, `stage_eval`, `stage_read_completions`.
 
-**Differential attention constraint:**
-- KV cache raises `NotImplementedError` with diff_attn. The RL script uses `Engine` (KV-cached) for rollout generation — this will need the same cache-free treatment as eval. See `generate_batch_no_cache()` in `scripts/chat_eval.py` for the pattern.
+**Differential attention KV cache — FIXED:**
+- `nanochat/gpt.py` now supports KV cache for diff_attn. Cache heads are partitioned: first `n_kv_head` slots = k1/v1, last `n_kv_head` slots = k2/v2. No changes needed to `KVCache` or `Engine`.
+- `generate_batch_no_cache()` fallback is no longer needed for RL. `Engine.generate_batch()` works directly.
+- Speedup: ~10-20x vs cache-free generation (O(T) vs O(T²)).
+
+**Part 3 run status:**
+- Run 1 (killed at step ~68, budget): reward 0.22→0.59, Pass@1=11.5% at step 0. W&B: `nanochat-rl/nanochat-part3_rl_baseline`.
+- Mid-training evals disabled (`--eval-every=9999`) to save cost. Run `stage_eval` separately after training.
+- Budget constraint: ~$0.28/step on 8×H100. Full 467-step run costs ~$130. Kill at step ~250 to stay under $80.
 
 **Known issues to watch for:**
 - `swiglu` key in old checkpoints — already fixed in `checkpoint_manager.py`
