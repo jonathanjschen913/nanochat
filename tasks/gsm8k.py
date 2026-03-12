@@ -34,13 +34,97 @@ def extract_answer(completion):
     return None
 
 
+def extract_numeric(text):
+    """Convert an answer string (e.g. '42', '-3.5', '1,200') to float, or None if unparseable."""
+    if text is None:
+        return None
+    try:
+        return float(text.replace(",", ""))
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Reward functions for Part 4
+# Each takes (pred_num: float|None, ref_num: float|None, assistant_response: str)
+# and returns a float reward in [0, 1].
+# ---------------------------------------------------------------------------
+
+def reward_binary(pred_num, ref_num, assistant_response):
+    """Original binary reward: 1.0 if exact string match, else 0.0."""
+    if pred_num is not None and ref_num is not None and pred_num == ref_num:
+        return 1.0
+    return 0.0
+
+
+def reward_format(pred_num, ref_num, assistant_response):
+    """Reward correct format: 1.0 if correct, 0.2 if #### present but wrong, 0.0 if no ####."""
+    if pred_num is not None and ref_num is not None and pred_num == ref_num:
+        return 1.0
+    if "####" in assistant_response:
+        return 0.2
+    return 0.0
+
+
+def reward_tolerance(pred_num, ref_num, assistant_response):
+    """Reward numerical closeness: 1.0 exact, 0.5 within 10%, 0.0 otherwise."""
+    pn = extract_numeric(str(pred_num)) if pred_num is not None else None
+    rn = extract_numeric(str(ref_num)) if ref_num is not None else None
+    if pn is not None and rn is not None:
+        if pn == rn:
+            return 1.0
+        if rn != 0 and abs(pn - rn) / abs(rn) <= 0.10:
+            return 0.5
+        if rn == 0 and abs(pn) <= 1e-6:
+            return 1.0
+    return 0.0
+
+
+def reward_steps(pred_num, ref_num, assistant_response):
+    """Reward showing work: 1.0 if correct, else partial credit for step-like structure."""
+    if pred_num is not None and ref_num is not None and pred_num == ref_num:
+        return 1.0
+    lines = assistant_response.strip().split("\n")
+    non_empty = [l for l in lines if l.strip()]
+    credit = 0.0
+    if len(non_empty) >= 3:
+        credit += 0.1
+    if assistant_response.count("=") >= 2:
+        credit += 0.1
+    digit_lines = [l for l in non_empty if any(c.isdigit() for c in l)]
+    if len(digit_lines) >= 2:
+        credit += 0.1
+    return credit
+
+
+def reward_combined(pred_num, ref_num, assistant_response):
+    """Weighted combination: 0.2*format + 0.3*tolerance + 0.5*steps."""
+    return (
+        0.2 * reward_format(pred_num, ref_num, assistant_response)
+        + 0.3 * reward_tolerance(pred_num, ref_num, assistant_response)
+        + 0.5 * reward_steps(pred_num, ref_num, assistant_response)
+    )
+
+
+REWARD_FNS = {
+    "binary": reward_binary,
+    "format": reward_format,
+    "tolerance": reward_tolerance,
+    "steps": reward_steps,
+    "combined": reward_combined,
+}
+
+
 class GSM8K(Task):
 
-    def __init__(self, subset, split, **kwargs):
+    def __init__(self, subset, split, reward_fn="binary", **kwargs):
         super().__init__(**kwargs)
         assert subset in ["main", "socratic"], "GSM8K subset must be main|socratic"
         assert split in ["train", "test"], "GSM8K split must be train|test"
+        assert reward_fn in REWARD_FNS, f"Unknown reward_fn '{reward_fn}', choose from {list(REWARD_FNS.keys())}"
         self.ds = load_dataset("openai/gsm8k", subset, split=split).shuffle(seed=42)
+        self.reward_fn = REWARD_FNS[reward_fn]
+        self.reward_fn_name = reward_fn
 
     @property
     def eval_type(self):
@@ -109,9 +193,14 @@ class GSM8K(Task):
 
     def reward(self, conversation, assistant_response):
         """
-        Used during RL. To keep things simple, just re-use the evaluation above.
-        Later this could be made more complex (e.g. format matching etc.)
+        Used during RL. Dispatches to the selected reward function.
+        Extracts pred/ref answer strings and passes them along with the full response.
         """
-        is_correct = self.evaluate(conversation, assistant_response)
-        is_correct_float = float(is_correct)
-        return is_correct_float
+        assert isinstance(assistant_response, str), "Assuming simple string response for now"
+        # Extract ground truth answer
+        assistant_message = conversation['messages'][-1]
+        assert assistant_message['role'] == "assistant"
+        last_text_part = assistant_message['content'][-1]['text']
+        ref_num = extract_answer(last_text_part)
+        pred_num = extract_answer(assistant_response)
+        return self.reward_fn(pred_num, ref_num, assistant_response)
