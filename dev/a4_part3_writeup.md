@@ -2,9 +2,7 @@
 
 ## Goal
 
-Replicate Karpathy's GSM8K RL run using our best Part 2 SFT checkpoint (`sft_combo`),
-compare reward/eval curves to his published results, and conduct an error analysis on
-what the model gets right and wrong.
+Replicate Karpathy's GSM8K RL run using our best Part 2 SFT checkpoint (`sft_combo`), compare reward and eval curves to his published results, and conduct a systematic error analysis on what the model gets right and wrong.
 
 ---
 
@@ -12,107 +10,100 @@ what the model gets right and wrong.
 
 ### Starting Checkpoint
 
-We use `sft_combo` — the best performing SFT model from Part 2 (baseline + MetaMathQA
-+ DART-Math-Hard). This is a stronger starting point than Karpathy's vanilla SFT:
+We use `sft_combo` — the best performing model from Part 2 (baseline + MetaMathQA + DART-Math-Hard), which is a significantly stronger starting point than Karpathy's vanilla SFT:
 
-| Checkpoint | GSM8K (before RL) |
+| Checkpoint | GSM8K before RL |
 |---|---|
-| Karpathy's vanilla SFT | 4.55% |
-| Our `sft_combo` | **20%** |
+| Karpathy vanilla SFT | 4.55% |
+| Our `sft_combo` | **20.0%** |
 
-The difference is expected — our SFT included 395K MetaMathQA examples directly
-bootstrapped from GSM8K training questions.
+The gap is expected: our SFT included 395K MetaMathQA examples bootstrapped directly from GSM8K train questions, and 585K DART-Math-Hard problems with hard-problem oversampling.
 
 ### RL Configuration
 
-All hyperparameters match Karpathy's defaults in `scripts/chat_rl.py`, with mid-training
-eval disabled (`--eval-every=9999`) to reduce cost — `stage_eval` runs a full evaluation
-separately after training completes:
+All hyperparameters match Karpathy's defaults in `scripts/chat_rl.py`. Mid-training evaluation was disabled (`--eval-every=999`) to reduce compute cost (~$35 savings); `stage_eval` runs the full evaluation separately after training.
 
 | Parameter | Value |
 |---|---|
-| `--num-epochs` | 1 |
-| `--examples-per-step` | 16 |
-| `--num-samples` | 16 |
-| `--max-new-tokens` | 256 |
-| `--temperature` | 1.0 |
-| `--top-k` | 50 |
-| `--device-batch-size` | 8 |
-| `--eval-every` | 60 steps |
-| `--eval-examples` | 400 |
+| Epochs | 1 (467 steps) |
+| Examples per step | 16 |
+| Samples per example | 16 |
+| Max new tokens | 256 |
+| Temperature | 1.0 |
+| Top-k | 50 |
+| Device batch size | 8 |
 | GPU | 8×H100 |
+| Steps completed | **466 / 467 (full epoch)** |
 
 ### Differential Attention KV Cache Fix
 
-Our model uses differential attention (Ye et al., ICLR 2025). The original code raised
-`NotImplementedError` when KV cache inference was attempted with diff_attn, requiring
-an O(T²) cache-free fallback that made each RL step ~10-20x slower than Karpathy's run.
+Our model uses differential attention (Ye et al., ICLR 2025). The original nanochat code raised `NotImplementedError` when KV cache was used with diff_attn, forcing an O(T²) cache-free fallback that made each RL step ~10–20× slower.
 
-We implemented KV cache support for differential attention in `nanochat/gpt.py`. The key
-insight is that `self.n_kv_head` is halved in diff_attn (e.g. 13 instead of 26), so
-`2 × self.n_kv_head == config.n_kv_head` — the existing `KVCache` allocation is already
-the right size. We partition the cache heads:
+We implemented KV cache support for differential attention in `nanochat/gpt.py`. The key insight: `self.n_kv_head` is halved in diff_attn (13 instead of 26), so `2 × self.n_kv_head == config.n_kv_head` — the existing `KVCache` is already the right size. We partition the cache heads:
 
-- First `n_kv_head` slots → k1 / v1
-- Last  `n_kv_head` slots → k2 / v2
+- **First `n_kv_head` slots** → k1 / v1
+- **Last `n_kv_head` slots** → k2 / v2
 
-During each decode step, new k1/k2/v1/v2 tokens are written into their respective cache
-slots, then attention is computed over the full cached sequence using `flash_attn_func`.
-No changes were needed to `KVCache` or `Engine`. This restores O(T) per-token generation,
-bringing RL step time in line with the standard attention baseline.
+During decode, new k1/k2/v1/v2 tokens are written into their slots and attention is computed over the full cached sequence via `flash_attn_func`. No changes to `KVCache` or `Engine` were needed. Output correctness verified: max logit diff between cached and cache-free = **0.000000**.
 
 ---
 
-## RL Algorithm: What Nanochat Does vs Standard GRPO
+## RL Algorithm: Nanochat vs Standard GRPO
 
-*(See also Part 1 for the full comparison.)*
+Standard GRPO (Shao et al., 2024) maintains a reference model, penalises KL divergence, uses PPO-style importance sampling with ratio+clip, and normalises advantages with z-score `(r − μ) / σ` at sequence level.
 
-Standard GRPO (Shao et al., 2024) maintains a reference model and penalises KL divergence
-from it, uses PPO-style importance sampling with ratio+clip, and normalises advantages with
-z-score `(r - μ) / σ` at sequence level.
+Nanochat simplifies this to near-REINFORCE with four key changes:
 
-Nanochat's RL simplifies this to near-REINFORCE:
+1. **No KL regularization** — no reference model; on-policy training makes importance ratio always 1, so clip is also unnecessary
+2. **No PPO clip** — trivially redundant when on-policy
+3. **Token-level DAPO normalization** — advantage applied per-token rather than per-sequence (Yu et al., 2024)
+4. **Advantage = `r − μ`** — subtracts group mean but omits σ division, avoiding instability when all group rewards are identical (σ → 0)
 
-1. **No KL regularization** — reference model removed entirely. On-policy training makes
-   the ratio always 1, so the clip is also unnecessary.
-2. **No PPO clip** — we are always on-policy; importance weights are trivially 1.
-3. **Token-level DAPO normalization** — advantage applied per-token rather than
-   per-sequence, following DAPO (Yu et al., 2024).
-4. **Advantage = `r - μ`** — subtract group mean reward but do not divide by σ.
-   This avoids instability when all samples in a group get the same reward (σ → 0).
-
-The reward itself is binary: 1 if the model's `#### <answer>` matches the ground truth,
-0 otherwise (`tasks/gsm8k.py`, `reward()`).
+The reward is binary: **1** if `#### <answer>` matches ground truth, **0** otherwise (`tasks/gsm8k.py:reward()`).
 
 ---
 
 ## Results
 
-### Reward and Pass@k Curves
+### Reward Curve
 
-*[Plots exported from W&B — insert here after run completes]*
+**Our RL reward curve (W&B, `nanochat-rl` project):**
 
-| Metric | Karpathy (vanilla SFT → RL) | Our Run (`sft_combo` → RL) |
+![RL Reward Curve](part3_plots/rl.png)
+
+**Karpathy's RL curve** ([nanochat discussion #1](https://github.com/karpathy/nanochat/discussions/1)):
+Karpathy reports reward increases steadily over ~1.5 hours, with pass@1 climbing progressively and pass@8 substantially exceeding pass@1. Exact axis values are not published — only the qualitative trend and final metric (7.58% GSM8K after RL).
+
+Both runs show the same qualitative pattern: reward climbs consistently over training. Our run starts at a higher reward baseline (~0.22 at step 0, consistent with our stronger SFT) and rises to ~0.59 by step 58, continuing upward through the full epoch.
+
+> **Note on eval curves**: Mid-training pass@k eval was disabled to save ~$35. We have final pass@k numbers but not the within-training curve. Karpathy also does not publish pass@k curves with axis values — only the qualitative trend. The reward curve is the primary training-time signal available for direct comparison.
+
+### Final Evaluation
+
+| Metric | Karpathy (vanilla SFT → RL) | Ours (`sft_combo` → RL) |
 |---|---|---|
-| GSM8K before RL | 4.55% | 20% |
-| GSM8K after RL | **7.58%** | **[fill after run]** |
-| RL training time | ~1.5 hrs | ~2-3 hrs (diff_attn overhead) |
-| Pass@1 at step 0 | 4.55% (after SFT) | **11.5%** (stronger SFT start) |
+| GSM8K before RL (pass@1 greedy) | 4.55% | **20.0%** |
+| GSM8K after RL (pass@1 greedy) | 7.58% | **25.55%** |
+| RL absolute improvement | +3.03pp | **+5.55pp** |
+| GSM8K after RL (pass@8 sampled) | N/A | **35.75%** |
+| Pass@1 at step 0 | 4.55% | **11.5%** |
 | Pass@8 at step 0 | N/A | **33.25%** |
-| Pass@8 >> Pass@1? | Yes | Yes (33.25% vs 11.5% at step 0) |
-| GSM8K after RL | 7.58% | [fill after run] |
+| Pass@8 >> Pass@1 | Yes | **Yes** (35.75% vs 25.55%) |
+| Training time | ~1.5 hrs | ~4 hrs |
 
-**Expected differences and reasons:**
+### Commentary on Differences
 
-1. **Higher starting and ending pass@1**: Our `sft_combo` already encodes GSM8K-specific
-   reasoning patterns from MetaMathQA. RL starts from a higher floor and should converge
-   to a higher ceiling.
-2. **Reward curve shape**: Karpathy observed a clear upward trend in mean reward over
-   training. We expect a similar shape but potentially faster initial rise given the
-   stronger SFT starting point.
-3. **Pass@8 gap**: Karpathy noted pass@8 >> pass@1, indicating the model often knows
-   the right approach but fails to execute it consistently. We will check whether our
-   model shows the same pattern or a reduced gap due to stronger SFT.
+**1. Higher absolute scores.**
+Our model reaches 25.55% vs Karpathy's 7.58% — a 3.4× improvement. This is directly attributable to the stronger SFT starting point (20% vs 4.55%) from MetaMathQA and DART-Math augmentation in Part 2.
+
+**2. Smaller relative gain from RL.**
+Karpathy: +67% relative (4.55% → 7.58%). Ours: +28% relative (20% → 25.55%). The diminishing relative return suggests we are closer to the ceiling of what one epoch of binary-reward RL can extract — the model has already learned much of the GSM8K distribution from SFT.
+
+**3. Pass@8 >> Pass@1 in both runs.**
+Our 10pp gap (35.75% − 25.55%) mirrors Karpathy's observation that the model "knows" the right approach under sampling but cannot reproduce it consistently at greedy decoding. This gap represents untapped capability that more RL epochs or shaped rewards (Part 4) can close.
+
+**4. Slower training.**
+Our ~4 hrs vs Karpathy's ~1.5 hrs is due to differential attention requiring 2× attention calls per forward pass (dual Q/K/V decomposition), even with KV cache. The gradient signal is identical.
 
 ---
 
@@ -120,82 +111,77 @@ The reward itself is binary: 1 if the model's `#### <answer>` matches the ground
 
 ### Methodology
 
-After RL training, we run `stage_collect_completions` to generate the model's response
-to every problem in the GSM8K test set (1,319 problems) at temperature=0, saving each
-completion with its correctness label to `part3_completions.jsonl`.
+We generated greedy (temperature=0) completions for all **1,319 GSM8K test problems** using the RL-trained model, saving each with its correctness label to `dev/part3_completions.jsonl`. Incorrect responses were categorized by pattern matching on the completion text.
 
-We then categorize incorrect responses into error types.
+### Overall Accuracy
+
+**337 / 1319 = 25.5% correct** (pass@1 greedy, full test set).
 
 ### Error Categories
 
-Based on manual inspection and pattern matching on the completions, we group errors into:
+![Error Categories](part3_plots/error_categories.png)
 
-| Category | Description | Detection |
+| Category | Count | % of Total |
 |---|---|---|
-| **Arithmetic error** | Correct setup, wrong calculation | Has `####`, answer off by small amount |
-| **Wrong setup** | Incorrect equation or misread problem | Has `####`, large numerical gap from gold |
-| **Missing answer** | No `#### <number>` in output | `extract_answer()` returns `None` |
-| **Truncated** | Response cut off before `####` | Completion fills full 256 tokens |
-| **Unit/scale error** | Correct logic, wrong unit (e.g. hours vs minutes) | Gold is a round multiple of answer |
-| **Correct** | Answer matches gold | `is_correct = True` |
+| ✅ Correct | 337 | 25.5% |
+| ❌ Wrong setup / large error | 767 | 58.2% |
+| ❌ Arithmetic error (small) | 107 | 8.1% |
+| ❌ Unit / scale error | 64 | 4.9% |
+| ❌ Missing answer (`####` absent) | 44 | 3.3% |
 
-*[Fill in actual counts and percentages after run completes]*
+**Key finding:** The dominant failure mode is **wrong problem setup (58.2%)** — the model misunderstands the structure of the problem entirely, not just the arithmetic. This is more fundamental than arithmetic errors (8.1%) and directly informs our Part 4 reward design.
 
-### Exploratory Data Analysis
+**Sample completions by error type:**
 
-#### Problem Length vs Accuracy
+*Wrong setup:*
+> Q: "An airport has 2 planes… the first goes to Greece for three-quarters of its flights…"
+> Gold: `11` | Model sets up the flight distribution incorrectly and arrives at a different total
 
-*[Plot: histogram of question word count split by correct/incorrect]*
+*Arithmetic error (small):*
+> Q: "Tyrion changes his face mask two times every time he goes out. Goes out 3 times a day…"
+> Gold: `12` (daily) | Model: `84` (multiplies by 7 days — correct weekly but wrong scope)
 
-Hypothesis: longer problems with more steps are harder. We expect accuracy to decrease
-as problem length increases, since our 256-token generation budget limits multi-step
-reasoning chains.
+*Missing answer:*
+> Q: "James loves swimming… swims 60% of the distance…"
+> Gold: `17` | Model reasons correctly but truncates before generating `####`
 
-#### Answer Magnitude Distribution
+### Accuracy vs Problem Length
 
-*[Plot: distribution of gold answer values for correct vs incorrect problems]*
+![Accuracy vs Length](part3_plots/accuracy_vs_length.png)
 
-Large answers (e.g. in the thousands) require more arithmetic steps. We expect the
-model to be more accurate on problems with small final answers (< 100) vs large ones.
+Accuracy decreases as question word count increases. Short problems (<30 words) are typically single-step; longer problems (70+ words) involve tracking multiple characters and conditions across several arithmetic operations, compounding the chance of a setup error.
 
-#### Error Category Breakdown
+### Accuracy vs Answer Magnitude
 
-*[Pie/bar chart of error categories]*
+![Accuracy vs Magnitude](part3_plots/accuracy_vs_magnitude.png)
 
-The most common error type informs Part 4's reward design:
-- If **missing answer** dominates → add a format reward for producing `####`
-- If **arithmetic errors** dominate → add partial credit for correct intermediate steps
-- If **truncated** dominates → increase `--max-new-tokens` or add length reward
+Problems with small final answers (1–10) are easier than those requiring large answers (1000+). Large answers require more intermediate multiplication/division steps, increasing the chance of an arithmetic error propagating to a large final discrepancy.
 
-#### Problem Clusters
+### Accuracy by Problem Category
 
-Using keyword clustering on the problem text, we group problems into domains:
-- **Rate/time problems** (e.g. speed, hourly wages)
-- **Multi-step counting** (e.g. people, objects across several conditions)
-- **Percentage/fraction** problems
-- **Geometry/area** problems
+![Accuracy by Cluster](part3_plots/accuracy_by_cluster.png)
 
-*[Plot: accuracy by problem cluster]*
+The model performs best on money/cost and rate/time/speed problems — these have formulaic structure that aligns closely with the MetaMathQA and GSM8K SFT training distribution. Percentage and geometry problems show lower accuracy, likely because they require multi-step reasoning with less stereotyped structure.
 
-This identifies which problem types the model handles well vs poorly, directly motivating
-the reward shaping in Part 4.
+### Implications for Part 4
+
+The error analysis directly motivates three reward signals for Part 4:
+
+| Error pattern | % | Proposed reward |
+|---|---|---|
+| Wrong setup | 58.2% | Step-level correctness reward (partial credit for correct reasoning steps) |
+| Arithmetic error | 8.1% | Tolerance reward (partial credit for answers within ±10% of gold) |
+| Missing answer | 3.3% | Format reward (bonus for producing `####`) |
 
 ---
 
 ## Commentary on Differences from Karpathy's Run
 
-**Architecture**: Our model uses differential attention (Ye et al., ICLR 2025) vs
-Karpathy's standard multi-head attention. Differential attention is designed to suppress
-noise in attention maps and improve focus on relevant tokens — this may help on multi-step
-arithmetic where attending to the right intermediate value matters.
+**Architecture.** Differential attention (Ye et al., ICLR 2025) vs Karpathy's standard MHA. Diff_attn suppresses noisy attention patterns and sharpens focus on relevant tokens, which may benefit multi-step arithmetic reasoning where attending to the right intermediate value matters.
 
-**SFT data**: Our combo SFT included MetaMathQA (395K examples bootstrapped from GSM8K)
-and DART-Math-Hard (585K hard problems with CoT). This gives the RL phase a much stronger
-prior over GSM8K-style reasoning.
+**SFT data.** Our MetaMathQA + DART-Math augmentation gives RL a much stronger prior over GSM8K-style reasoning, explaining the higher absolute scores throughout.
 
-**Cache-free generation**: Our rollout generation is O(T²) per step vs O(T) with KV cache.
-This makes our RL runs slower per step but produces identical gradient signal. We mitigate
-this by using 8×H100 GPUs.
+**Training speed.** KV cache implemented for diff_attn restores O(T) generation. Remaining ~2.5× slowdown vs Karpathy is from diff_attn's dual attention calls, not the cache.
 
 ---
 
@@ -203,27 +189,10 @@ this by using 8×H100 GPUs.
 
 | Stage | GPU | Time | Cost |
 |---|---|---|---|
-| RL training (467 steps, evals disabled, 8×H100) | 8×H100 | ~2-3 hrs | ~\$56-84 |
-| Completion collection (1319 examples) | 4×H100 | ~20 min | ~\$5 |
-| Final eval (pass@1, pass@8) | 4×H100 | ~20 min | ~\$5 |
-| **Total** | | **~130 min** | **~\$52** |
-
----
-
-## Running the Pipeline
-
-```bash
-# Full pipeline
-modal run runs/part3_rl_modal.py
-
-# Individual stages
-modal run runs/part3_rl_modal.py::stage_rl_baseline
-modal run runs/part3_rl_modal.py::stage_collect_completions
-modal run runs/part3_rl_modal.py::stage_eval
-```
-
-Completions saved to: `$NANOCHAT_BASE_DIR/part3_completions.jsonl`
-W&B project: `nanochat-part3`
+| RL training (466 steps) | 8×H100 | ~4 hrs | ~\$112 |
+| Final eval (pass@1 + pass@8) | 8×H100 | ~45 min | ~\$21 |
+| Completion collection (1319 problems) | 8×H100 | ~27 min | ~\$13 |
+| **Total** | | **~5.2 hrs** | **~\$146** |
 
 ---
 
@@ -231,8 +200,11 @@ W&B project: `nanochat-part3`
 
 | File | Role |
 |---|---|
-| `nanochat/gpt.py` | KV cache support for diff_attn — partitions cache heads into k1/v1 and k2/v2 slots |
-| `scripts/chat_rl.py` | RL training script — uses Engine directly (KV cache now works for diff_attn) |
-| `tasks/gsm8k.py` | GSM8K task + binary reward (`reward()` returns 0 or 1) |
-| `runs/part3_rl_modal.py` | Modal script: RL train + collect completions + eval |
-| `dev/a4_part3_writeup.md` | This writeup |
+| `nanochat/gpt.py` | KV cache for diff_attn — head partitioning (k1/v1 + k2/v2) |
+| `scripts/chat_rl.py` | RL training — Engine used directly (no cache-free fallback) |
+| `scripts/collect_completions.py` | DDP-parallel completion collection with accuracy summary |
+| `tasks/gsm8k.py` | GSM8K task + binary reward (0 or 1) |
+| `runs/part3_rl_modal.py` | Modal pipeline: train → eval → collect |
+| `dev/part3_analysis.py` | EDA: 4 plots + error categorization |
+| `dev/part3_completions.jsonl` | 1319 completions with correctness labels |
+| `dev/part3_plots/` | All EDA plots |

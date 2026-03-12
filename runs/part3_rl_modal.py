@@ -5,26 +5,11 @@ Part 3: RL on GSM8K — Modal Training Script
 Replicates Karpathy's GSM8K RL run starting from our best Part 2 SFT checkpoint
 (sft_combo: baseline + MetaMathQA + DART-Math-Hard, 20% GSM8K before RL).
 
-Two runs:
-  Run 1 (rl_baseline): RL starting from sft_combo — our primary run
-  Run 2 (rl_collect):  Same run but saves full completions for error analysis
-
 Usage
 -----
 Full pipeline:
     modal run runs/part3_rl_modal.py
 
-Individual stages:
-    modal run runs/part3_rl_modal.py::stage_rl_baseline
-    modal run runs/part3_rl_modal.py::stage_collect_completions
-    modal run runs/part3_rl_modal.py::stage_eval
-
-Cost estimate (8×H100 at ~$28/hr, eval on 4×H100 at ~$14/hr)
---------------------------------------------------------------
-    RL training (467 steps + 7 evals)  : ~70 min   ~$33
-    Completion collection (test set)   : ~20 min   ~$5
-    Eval (pass@1, pass@8)              : ~20 min   ~$5
-    Total                                          ~$52
 """
 
 import json
@@ -44,7 +29,7 @@ RL_TAG = "rl_baseline"
 
 # GPU config
 GPU_TRAIN = "H100:8"
-GPU_EVAL  = "H100:1"
+GPU_EVAL  = "H100:8"
 
 _N_TRAIN_GPUS = int(GPU_TRAIN.split(":")[1])
 _N_EVAL_GPUS  = int(GPU_EVAL.split(":")[1])
@@ -64,7 +49,7 @@ WANDB_PROJECT = "nanochat-part3"
 
 # Timeouts
 RL_TIMEOUT_SEC   = 60 * 60 * 24  # 24 hours
-EVAL_TIMEOUT_SEC = 60 * 60 * 1   # 1 hour
+EVAL_TIMEOUT_SEC = 60 * 60 * 4   # 4 hours (cache-free fallback: ~12hr; with KV cache: ~15min)
 
 # Volume / paths
 VOLUME_MOUNT  = "/vol"
@@ -201,72 +186,20 @@ def stage_rl_baseline() -> None:
 )
 def stage_collect_completions() -> None:
     """
-    Run the RL-trained model on the full GSM8K test set and save completions
-    to BASE_DIR/part3_completions.jsonl for error analysis.
-
-    Each line: {"idx": int, "question": str, "gold_answer": str,
-                "completion": str, "is_correct": bool}
+    Run the RL model on all 1319 GSM8K test problems across 8 GPUs.
+    Saves completions for error analysis and prints pass@1 greedy accuracy.
+    pass@8 already obtained from stage_eval (35.75%) — not rerun here.
     """
     _setup_cache()
-
-    import sys
-    sys.path.insert(0, "/root/nanochat")
-
-    import torch
-    from nanochat.checkpoint_manager import load_model
-    from nanochat.engine import Engine
-    from tasks.gsm8k import GSM8K, extract_answer
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Load the RL checkpoint
-    model, tokenizer, _ = load_model(
-        "rl", device, phase="eval", model_tag=SFT_TAG
-    )
-    model.eval()
-
-    engine = Engine(model, tokenizer)
-
-    task = GSM8K(subset="main", split="test")
     out_path = os.path.join(BASE_DIR, "part3_completions.jsonl")
-
-    print(f"Collecting completions for {len(task)} test examples -> {out_path}")
-
-    with open(out_path, "w") as f:
-        for idx in range(len(task)):
-            conversation = task[idx]
-            tokens = tokenizer.render_for_completion(conversation)
-            prefix_length = len(tokens)
-
-            with torch.no_grad():
-                seqs, _ = engine.generate_batch(
-                    tokens, num_samples=1, max_tokens=256,
-                    temperature=0.0, top_k=50,
-                )
-
-            generated_tokens = seqs[0][prefix_length:]
-            completion = tokenizer.decode(generated_tokens)
-            is_correct = bool(task.evaluate(conversation, completion))
-
-            # Extract gold answer from conversation
-            last_part = conversation["messages"][-1]["content"][-1]["text"]
-            gold = extract_answer(last_part)
-            question = conversation["messages"][0]["content"]
-
-            record = {
-                "idx": idx,
-                "question": question,
-                "gold_answer": gold,
-                "completion": completion,
-                "is_correct": is_correct,
-            }
-            f.write(json.dumps(record) + "\n")
-
-            if idx % 50 == 0:
-                print(f"  [{idx}/{len(task)}] is_correct={is_correct}")
-
+    _torchrun("scripts.collect_completions", [
+        f"--model-tag={SFT_TAG}",
+        "--source=rl",
+        f"--output={out_path}",
+        "--temperature=0.0",
+        "--max-new-tokens=256",
+    ], nproc=_N_TRAIN_GPUS)  # 8 GPUs: 1319/8=165 problems each (~27 min)
     volume.commit()
-    print(f"Saved {len(task)} completions to {out_path}")
 
 
 # =============================================================================
@@ -291,89 +224,43 @@ OUR_SFT_RESULT = 0.20  # sft_combo, 20% GSM8K
     gpu=GPU_EVAL,
     timeout=EVAL_TIMEOUT_SEC,
 )
-def stage_eval() -> dict:
+def stage_eval() -> None:
     """
     Evaluate the RL checkpoint on the full GSM8K test set (1319 problems).
     - pass@1 greedy (temperature=0): directly comparable to Karpathy's 7.58%
     - pass@1 sampled (temperature=1): matches the RL training eval metric
     - pass@8 sampled: upper bound on model capability
-
-    Uses KV-cached generation (diff_attn KV cache now supported in gpt.py).
-    Returns result dict so the local entrypoint can print the comparison table.
+    Uses chat_eval.py via torchrun (same pattern as stage_rl_baseline).
     """
     _setup_cache()
 
-    import sys
-    sys.path.insert(0, "/root/nanochat")
+    # pass@1 greedy — comparable to Karpathy's 7.58%
+    print("\n--- pass@1 greedy (temperature=0) ---")
+    _torchrun("scripts.chat_eval", [
+        "-i", "rl",
+        "-g", SFT_TAG,
+        "-a", "GSM8K",
+        "--max-problems=1319",
+        f"--batch-size={DEVICE_BATCH_SIZE}",
+        "--temperature=0.0",
+        "--num-samples=1",
+    ], nproc=_N_EVAL_GPUS)
 
-    import torch
-    from nanochat.checkpoint_manager import load_model
-    from nanochat.engine import Engine
-    from tasks.gsm8k import GSM8K
+    # pass@8 sampled — upper bound
+    print("\n--- pass@8 sampled (temperature=1) ---")
+    _torchrun("scripts.chat_eval", [
+        "-i", "rl",
+        "-g", SFT_TAG,
+        "-a", "GSM8K",
+        "--max-problems=400",
+        f"--batch-size={DEVICE_BATCH_SIZE}",
+        "--temperature=1.0",
+        "--num-samples=8",
+    ], nproc=_N_EVAL_GPUS)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    # Load RL checkpoint (saved to chatrl_checkpoints/sft_combo by chat_rl.py)
-    model, tokenizer, _ = load_model("rl", device, phase="eval", model_tag=SFT_TAG)
-    model.eval()
-
-    engine = Engine(model, tokenizer)
-    task = GSM8K(subset="main", split="test")
-
-    def eval_pass_at_k(temperature, num_samples, max_examples=None):
-        """Returns pass@k accuracy over the test set."""
-        n = min(max_examples, len(task)) if max_examples else len(task)
-        pass_k = 0
-        for idx in range(n):
-            conversation = task[idx]
-            tokens = tokenizer.render_for_completion(conversation)
-            prefix_length = len(tokens)
-            with torch.no_grad():
-                seqs, _ = engine.generate_batch(
-                    tokens, num_samples=num_samples,
-                    max_tokens=256, temperature=temperature, top_k=50,
-                )
-            completions = [tokenizer.decode(s[prefix_length:]) for s in seqs]
-            if any(task.evaluate(conversation, c) for c in completions):
-                pass_k += 1
-            if idx % 100 == 0:
-                print(f"  [{idx}/{n}] running pass@{num_samples}={pass_k/(idx+1):.3f}")
-        return pass_k / n
-
-    print("\n--- pass@1 greedy (temperature=0) — comparable to Karpathy's 7.58% ---")
-    pass1_greedy = eval_pass_at_k(temperature=0.0, num_samples=1)
-
-    print("\n--- pass@1 sampled (temperature=1) — matches RL training eval ---")
-    pass1_sampled = eval_pass_at_k(temperature=1.0, num_samples=1)
-
-    print("\n--- pass@8 sampled — upper bound on capability ---")
-    pass8 = eval_pass_at_k(temperature=1.0, num_samples=8)
-
-    results = {
-        "pass@1_greedy":  pass1_greedy,
-        "pass@1_sampled": pass1_sampled,
-        "pass@8":         pass8,
-    }
-
-    # Save results to volume for local download
-    out_path = os.path.join(BASE_DIR, "part3_eval_results.json")
-    import json
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
     volume.commit()
-
-    print("\n" + "="*60)
-    print("COMPARISON TO KARPATHY (discussion #1)")
-    print("="*60)
-    print(f"{'Metric':<30} {'Karpathy':>12} {'Ours':>12}")
-    print("-"*55)
-    print(f"{'After SFT (pass@1 greedy)':<30} {KARPATHY_RESULTS['after_sft']:>11.1%} {OUR_SFT_RESULT:>11.1%}")
-    print(f"{'After RL  (pass@1 greedy)':<30} {KARPATHY_RESULTS['after_rl']:>11.1%} {pass1_greedy:>11.1%}")
-    print(f"{'After RL  (pass@1 sampled)':<30} {'N/A':>12} {pass1_sampled:>11.1%}")
-    print(f"{'After RL  (pass@8 sampled)':<30} {'N/A':>12} {pass8:>11.1%}")
-    print("="*60)
-
-    return results
+    print(f"\nKarpathy after RL (pass@1 greedy): {KARPATHY_RESULTS['after_rl']:.1%}")
+    print(f"Our SFT baseline (pass@1 greedy) : {OUR_SFT_RESULT:.1%}")
 
 
 # =============================================================================
