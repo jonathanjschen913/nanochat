@@ -13,14 +13,16 @@ Defaults to "combined" if not set.
 Usage
 -----
 Full pipeline (combined reward):
-    modal run runs/part4_rl_modal.py
+    PYTHONUTF8=1 modal run runs/part4_rl_modal.py
 
 Single reward:
-    REWARD_FN=tolerance modal run runs/part4_rl_modal.py
+    REWARD_FN=tolerance PYTHONUTF8=1 modal run runs/part4_rl_modal.py
+
+Budget-friendly (cap training steps):
+    MAX_STEPS=60 REWARD_FN=combined PYTHONUTF8=1 modal run runs/part4_rl_modal.py
 
 """
 
-import json
 import os
 import subprocess
 from modal import App, Image as ModalImage, Volume, Secret
@@ -33,6 +35,11 @@ from modal import App, Image as ModalImage, Volume, Secret
 REWARD_FN = os.environ.get("REWARD_FN", "combined")
 assert REWARD_FN in ("binary", "format", "tolerance", "steps", "combined"), \
     f"Unknown REWARD_FN='{REWARD_FN}', choose from: binary, format, tolerance, steps, combined"
+
+# Optional: cap training steps (useful for budget-constrained runs)
+MAX_STEPS = os.environ.get("MAX_STEPS", None)
+if MAX_STEPS is not None:
+    MAX_STEPS = int(MAX_STEPS)
 
 # SFT checkpoint to start RL from (best from Part 2, same as Part 3)
 SFT_TAG = "sft_combo"
@@ -184,6 +191,8 @@ def stage_rl_train() -> None:
         "--eval-examples=400",
         "--save-every=60",
     ]
+    if MAX_STEPS is not None:
+        args.append(f"--max-steps={MAX_STEPS}")
     _torchrun("scripts.chat_rl", args, nproc=_N_TRAIN_GPUS)
     volume.commit()
     print(f"RL training complete (reward_fn={REWARD_FN}). Checkpoint saved to chatrl_checkpoints/{RL_TAG}/")
@@ -231,6 +240,52 @@ def stage_eval() -> None:
 
 
 # =============================================================================
+# STAGE: COLLECT COMPLETIONS (for error analysis / writeup)
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    gpu=GPU_EVAL,
+    timeout=EVAL_TIMEOUT_SEC,
+)
+def stage_collect_completions() -> None:
+    """Collect greedy completions on all 1319 GSM8K test problems for error analysis."""
+    _setup_cache()
+    out_path = os.path.join(BASE_DIR, f"part4_completions_{REWARD_FN}.jsonl")
+    _torchrun("scripts.collect_completions", [
+        f"--model-tag={RL_TAG}",
+        "--source=rl",
+        f"--output={out_path}",
+        "--temperature=0.0",
+        "--max-new-tokens=256",
+    ], nproc=_N_EVAL_GPUS)
+    volume.commit()
+    print(f"Completions saved to {out_path}")
+
+
+# =============================================================================
+# STAGE: DOWNLOAD COMPLETIONS to local machine
+# =============================================================================
+
+@app.function(
+    image=image,
+    secrets=[secret],
+    volumes={VOLUME_MOUNT: volume},
+    timeout=60 * 5,
+)
+def stage_read_completions() -> bytes:
+    """Return completions file contents so the local entrypoint can save it."""
+    _setup_cache()
+    path = os.path.join(BASE_DIR, f"part4_completions_{REWARD_FN}.jsonl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Completions not found at {path}. Run stage_collect_completions first.")
+    with open(path, "rb") as f:
+        return f.read()
+
+
+# =============================================================================
 # MAIN ENTRYPOINT
 # =============================================================================
 
@@ -242,16 +297,28 @@ def main() -> None:
     print(f"  Reward function    : {REWARD_FN}")
     print(f"  SFT starting point : {SFT_TAG}")
     print(f"  RL output tag      : {RL_TAG}")
+    print(f"  Max steps          : {MAX_STEPS or 'full epoch (467)'}")
     print(f"  GPU                : {GPU_TRAIN}")
     print(f"  W&B run name       : rl-part4-{REWARD_FN}")
     print("=" * w + "\n")
 
-    print(f"[1/2] RL training with reward_fn={REWARD_FN}...")
+    print(f"[1/4] RL training with reward_fn={REWARD_FN}...")
     stage_rl_train.remote()
 
-    print("[2/2] Final eval...")
+    print("[2/4] Collecting completions for error analysis...")
+    stage_collect_completions.remote()
+
+    print("[3/4] Final eval...")
     stage_eval.remote()
+
+    print("[4/4] Downloading completions locally...")
+    data = stage_read_completions.remote()
+    local_path = f"dev/part4_completions_{REWARD_FN}.jsonl"
+    with open(local_path, "wb") as f:
+        f.write(data)
+    print(f"Completions saved locally to: {local_path}")
 
     print("\n" + "=" * w)
     print(f"Done. Check W&B project '{WANDB_PROJECT}' for run 'rl-part4-{REWARD_FN}'.")
+    print(f"Completions: {local_path}")
     print("=" * w + "\n")
