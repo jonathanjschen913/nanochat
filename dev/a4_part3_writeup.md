@@ -21,7 +21,7 @@ The gap is expected: our SFT included 395K MetaMathQA examples bootstrapped dire
 
 ### RL Configuration
 
-All hyperparameters match Karpathy's defaults in `scripts/chat_rl.py`. Mid-training evaluation was disabled (`--eval-every=999`) to reduce compute cost (~$35 savings); `stage_eval` runs the full evaluation separately after training.
+All hyperparameters match Karpathy's defaults in `scripts/chat_rl.py`. Mid-training evaluation was disabled (`--eval-every=999`) to reduce compute cost (~$35 savings). After training, `stage_collect_completions` runs a single combined stage that collects greedy completions on all 1,319 test problems (for error analysis), reports pass@1 accuracy, and runs pass@8 sampling eval — replacing the previously separate `stage_eval` and `stage_collect_completions` stages.
 
 | Parameter | Value |
 |---|---|
@@ -48,20 +48,6 @@ During decode, new k1/k2/v1/v2 tokens are written into their slots and attention
 
 ---
 
-## RL Algorithm: Nanochat vs Standard GRPO
-
-Standard GRPO (Shao et al., 2024) maintains a reference model, penalises KL divergence, uses PPO-style importance sampling with ratio+clip, and normalises advantages with z-score `(r − μ) / σ` at sequence level.
-
-Nanochat simplifies this to near-REINFORCE with four key changes:
-
-1. **No KL regularization** — no reference model; on-policy training makes importance ratio always 1, so clip is also unnecessary
-2. **No PPO clip** — trivially redundant when on-policy
-3. **Token-level DAPO normalization** — advantage applied per-token rather than per-sequence (Yu et al., 2024)
-4. **Advantage = `r − μ`** — subtracts group mean but omits σ division, avoiding instability when all group rewards are identical (σ → 0)
-
-The reward is binary: **1** if `#### <answer>` matches ground truth, **0** otherwise (`tasks/gsm8k.py:reward()`).
-
----
 
 ## Results
 
@@ -71,8 +57,19 @@ The reward is binary: **1** if `#### <answer>` matches ground truth, **0** other
 
 ![RL Reward Curve](part3_plots/rl.png)
 
-**Karpathy's RL curve** ([nanochat discussion #1](https://github.com/karpathy/nanochat/discussions/1)):
-Karpathy reports reward increases steadily over ~1.5 hours, with pass@1 climbing progressively and pass@8 substantially exceeding pass@1. Exact axis values are not published — only the qualitative trend and final metric (7.58% GSM8K after RL).
+**Karpathy's RL results** (source: [nanochat discussion #1](https://github.com/karpathy/nanochat/discussions/1)):
+Karpathy reports reward increases steadily over ~1.5 hours, with pass@1 climbing
+progressively and pass@8 substantially exceeding pass@1. The discussion reports the
+following progression across training stages:
+
+| Stage | GSM8K |
+|---|---|
+| After mid-training | 2.50% |
+| After SFT | 4.55% |
+| **After RL** | **7.58%** |
+
+These are the reference numbers we compare against throughout this writeup. Exact reward
+curve axis values are not published — only the qualitative trend and final metrics above.
 
 Both runs show the same qualitative pattern: reward climbs consistently over training. Our run starts at a higher reward baseline (~0.22 at step 0, consistent with our stronger SFT) and rises to ~0.59 by step 58, continuing upward through the full epoch.
 
@@ -190,9 +187,8 @@ The error analysis directly motivates three reward signals for Part 4:
 | Stage | GPU | Time | Cost |
 |---|---|---|---|
 | RL training (466 steps) | 8×H100 | ~4 hrs | ~\$112 |
-| Final eval (pass@1 + pass@8) | 8×H100 | ~45 min | ~\$21 |
-| Completion collection (1319 problems) | 8×H100 | ~27 min | ~\$13 |
-| **Total** | | **~5.2 hrs** | **~\$146** |
+| Eval + completion collection (combined) | 8×H100 | ~60 min | ~\$28 |
+| **Total** | | **~5 hrs** | **~\$140** |
 
 ---
 
@@ -204,7 +200,21 @@ The error analysis directly motivates three reward signals for Part 4:
 | `scripts/chat_rl.py` | RL training — Engine used directly (no cache-free fallback) |
 | `scripts/collect_completions.py` | DDP-parallel completion collection with accuracy summary |
 | `tasks/gsm8k.py` | GSM8K task + binary reward (0 or 1) |
-| `runs/part3_rl_modal.py` | Modal pipeline: train → eval → collect |
+| `runs/part3_rl_modal.py` | Modal pipeline: train → combined eval + collect completions |
 | `dev/part3_analysis.py` | EDA: 4 plots + error categorization |
 | `dev/part3_completions.jsonl` | 1319 completions with correctness labels |
 | `dev/part3_plots/` | All EDA plots |
+
+---
+
+## References
+
+Cobbe, K., Kosaraju, V., Bavarian, M., et al. (2021). Training Verifiers to Solve Math Word Problems. *arXiv preprint arXiv:2110.14168*.
+
+Karpathy, A. (2025). nanochat: A tiny chatbot arena and training harness. https://github.com/karpathy/nanochat/discussions/1
+
+Shao, Z., Wang, P., Zhu, Q., et al. (2024). DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models (GRPO). *arXiv preprint arXiv:2402.03300*.
+
+Ye, T., Dong, L., Xia, Y., et al. (2025). Differential Attention. *ICLR 2025*. arXiv:2410.05258.
+
+Yu, J., et al. (2024). DAPO: An Open-Source LLM Reinforcement Learning System at Scale. *arXiv preprint arXiv:2503.14476*.
