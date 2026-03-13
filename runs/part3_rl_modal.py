@@ -10,9 +10,20 @@ Usage
 Full pipeline:
     modal run runs/part3_rl_modal.py
 
+Individual stages:
+    modal run runs/part3_rl_modal.py::stage_rl_baseline
+    modal run runs/part3_rl_modal.py::stage_collect_completions
+
+Download completions locally after collection:
+    modal volume get nanochat-vol nanochat_cache/part3_completions.jsonl dev/part3_completions.jsonl
+
+Cost estimate (8×H100 at ~$28/hr)
+-----------------------------------
+    RL training (467 steps, no mid-eval) : ~4 hrs   ~$112
+    Eval + completion collection         : ~60 min  ~$28
+    Total                                           ~$140
 """
 
-import json
 import os
 import subprocess
 from modal import App, Image as ModalImage, Volume, Secret
@@ -21,38 +32,29 @@ from modal import App, Image as ModalImage, Volume, Secret
 # CONFIGURATION
 # =============================================================================
 
-# SFT checkpoint to start RL from (best from Part 2)
-SFT_TAG = "sft_combo"
+SFT_TAG = "sft_combo"  # Part 2 best checkpoint (20% GSM8K)
 
-# RL checkpoint output tags
-RL_TAG = "rl_baseline"
-
-# GPU config
 GPU_TRAIN = "H100:8"
 GPU_EVAL  = "H100:8"
 
 _N_TRAIN_GPUS = int(GPU_TRAIN.split(":")[1])
 _N_EVAL_GPUS  = int(GPU_EVAL.split(":")[1])
 
-# RL hyperparameters — match Karpathy's defaults
-DEVICE_BATCH_SIZE  = 8   # d=26 OOM at 16 during generation
+DEVICE_BATCH_SIZE  = 8
 EXAMPLES_PER_STEP  = 16
 NUM_SAMPLES        = 16
 MAX_NEW_TOKENS     = 256
 TEMPERATURE        = 1.0
 TOP_K              = 50
-NUM_EPOCHS         = 1  # = 467 steps; at ~1 min/step = ~8 hrs — consider killing at ~200 steps if needed
+NUM_EPOCHS         = 1
 
-# W&B
-# NOTE: chat_rl.py hardcodes project="nanochat-rl" — only the run *name* uses this value
+# NOTE: chat_rl.py hardcodes project="nanochat-rl" — only the run name uses this value
 WANDB_PROJECT = "nanochat-part3"
 
-# Timeouts
 RL_TIMEOUT_SEC   = 60 * 60 * 24  # 24 hours
-EVAL_TIMEOUT_SEC = 60 * 60 * 4   # 4 hours (cache-free fallback: ~12hr; with KV cache: ~15min)
+EVAL_TIMEOUT_SEC = 60 * 60 * 4   # 4 hours
 
-# Volume / paths
-VOLUME_MOUNT  = "/vol"
+VOLUME_MOUNT   = "/vol"
 NANOCHAT_CACHE = f"{VOLUME_MOUNT}/nanochat_cache"
 BASE_DIR       = "/data/.cache/nanochat"
 
@@ -109,13 +111,6 @@ def _torchrun(module: str, args: list | None = None, *, nproc: int) -> None:
         raise RuntimeError(f"Command exited with code {result.returncode}:\n  {cmd}")
 
 
-def _run(cmd: str) -> None:
-    print(f"\n>>>  {cmd}\n")
-    result = subprocess.run(["bash", "-c", cmd], check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"Command exited with code {result.returncode}:\n  {cmd}")
-
-
 def _setup_cache() -> None:
     os.makedirs(NANOCHAT_CACHE, exist_ok=True)
     if not os.path.lexists(BASE_DIR):
@@ -127,7 +122,7 @@ def _setup_cache() -> None:
 
 
 # =============================================================================
-# STAGE: RL TRAINING (Run 1 — baseline replication)
+# STAGE: RL TRAINING
 # =============================================================================
 
 @app.function(
@@ -139,13 +134,12 @@ def _setup_cache() -> None:
 )
 def stage_rl_baseline() -> None:
     """
-    Run 1: RL on GSM8K starting from sft_combo.
+    RL on GSM8K starting from sft_combo with binary reward.
     Replicates Karpathy's default chat_rl.py settings.
-    Logs reward curve and pass@k to W&B project nanochat-part3.
+    Checkpoint saved to chatrl_checkpoints/sft_combo/.
     """
     _setup_cache()
 
-    # Verify the Part 2 SFT checkpoint exists before spending GPU time
     sft_dir = os.path.join(BASE_DIR, "chatsft_checkpoints", SFT_TAG)
     if not os.path.isdir(sft_dir):
         raise FileNotFoundError(
@@ -154,9 +148,9 @@ def stage_rl_baseline() -> None:
         )
     print(f"Found SFT checkpoint: {sft_dir}")
 
-    args = [
-        f"--run={WANDB_PROJECT}_{RL_TAG}",
-        f"--model-tag={SFT_TAG}",        # load from chatsft_checkpoints/sft_combo
+    _torchrun("scripts.chat_rl", [
+        f"--run={WANDB_PROJECT}_rl_baseline",
+        f"--model-tag={SFT_TAG}",
         f"--device-batch-size={DEVICE_BATCH_SIZE}",
         f"--examples-per-step={EXAMPLES_PER_STEP}",
         f"--num-samples={NUM_SAMPLES}",
@@ -164,17 +158,15 @@ def stage_rl_baseline() -> None:
         f"--temperature={TEMPERATURE}",
         f"--top-k={TOP_K}",
         f"--num-epochs={NUM_EPOCHS}",
-        "--eval-every=999",   # effectively disabled (step 0 skipped via chat_rl.py fix); run stage_eval separately
-        "--eval-examples=400",
+        "--eval-every=999",
         "--save-every=60",
-    ]
-    _torchrun("scripts.chat_rl", args, nproc=_N_TRAIN_GPUS)
+    ], nproc=_N_TRAIN_GPUS)
     volume.commit()
-    print(f"RL training complete. Checkpoint saved to chatrl_checkpoints/{SFT_TAG}/")
+    print(f"RL training complete. Checkpoint: chatrl_checkpoints/{SFT_TAG}/")
 
 
 # =============================================================================
-# STAGE: COLLECT COMPLETIONS (for Part 3 error analysis)
+# STAGE: COLLECT COMPLETIONS + EVAL (combined)
 # =============================================================================
 
 @app.function(
@@ -186,68 +178,27 @@ def stage_rl_baseline() -> None:
 )
 def stage_collect_completions() -> None:
     """
-    Run the RL model on all 1319 GSM8K test problems across 8 GPUs.
-    Saves completions for error analysis and prints pass@1 greedy accuracy.
-    pass@8 already obtained from stage_eval (35.75%) — not rerun here.
+    Combined eval + completion collection:
+    - Collects greedy completions on all 1319 GSM8K test problems (8 GPUs)
+    - Reports pass@1 greedy accuracy (comparable to Karpathy's 7.58%)
+    - Runs pass@8 sampled eval for upper bound
+    Saves completions to BASE_DIR/part3_completions.jsonl.
+    Download locally: modal volume get nanochat-vol nanochat_cache/part3_completions.jsonl dev/part3_completions.jsonl
     """
     _setup_cache()
+
     out_path = os.path.join(BASE_DIR, "part3_completions.jsonl")
+
+    print("\n--- pass@1 greedy + collecting completions (1319 problems, 8 GPUs) ---")
     _torchrun("scripts.collect_completions", [
         f"--model-tag={SFT_TAG}",
         "--source=rl",
         f"--output={out_path}",
         "--temperature=0.0",
         "--max-new-tokens=256",
-    ], nproc=_N_TRAIN_GPUS)  # 8 GPUs: 1319/8=165 problems each (~27 min)
-    volume.commit()
-
-
-# =============================================================================
-# STAGE: FINAL EVAL — GSM8K pass@1 greedy (matches Karpathy's reported metric)
-# =============================================================================
-
-# Karpathy's published numbers from https://github.com/karpathy/nanochat/discussions/1
-KARPATHY_RESULTS = {
-    "after_midtraining": 0.0250,
-    "after_sft":         0.0455,
-    "after_rl":          0.0758,  # <-- what we compare our RL run against
-}
-
-# Our Part 2 SFT result (from a4_part2_writeup.md, n=50 eval)
-OUR_SFT_RESULT = 0.20  # sft_combo, 20% GSM8K
-
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    volumes={VOLUME_MOUNT: volume},
-    gpu=GPU_EVAL,
-    timeout=EVAL_TIMEOUT_SEC,
-)
-def stage_eval() -> None:
-    """
-    Evaluate the RL checkpoint on the full GSM8K test set (1319 problems).
-    - pass@1 greedy (temperature=0): directly comparable to Karpathy's 7.58%
-    - pass@1 sampled (temperature=1): matches the RL training eval metric
-    - pass@8 sampled: upper bound on model capability
-    Uses chat_eval.py via torchrun (same pattern as stage_rl_baseline).
-    """
-    _setup_cache()
-
-    # pass@1 greedy — comparable to Karpathy's 7.58%
-    print("\n--- pass@1 greedy (temperature=0) ---")
-    _torchrun("scripts.chat_eval", [
-        "-i", "rl",
-        "-g", SFT_TAG,
-        "-a", "GSM8K",
-        "--max-problems=1319",
-        f"--batch-size={DEVICE_BATCH_SIZE}",
-        "--temperature=0.0",
-        "--num-samples=1",
     ], nproc=_N_EVAL_GPUS)
 
-    # pass@8 sampled — upper bound
-    print("\n--- pass@8 sampled (temperature=1) ---")
+    print("\n--- pass@8 sampled (temperature=1, 400 problems) ---")
     _torchrun("scripts.chat_eval", [
         "-i", "rl",
         "-g", SFT_TAG,
@@ -259,27 +210,8 @@ def stage_eval() -> None:
     ], nproc=_N_EVAL_GPUS)
 
     volume.commit()
-    print(f"\nKarpathy after RL (pass@1 greedy): {KARPATHY_RESULTS['after_rl']:.1%}")
-    print(f"Our SFT baseline (pass@1 greedy) : {OUR_SFT_RESULT:.1%}")
-
-
-# =============================================================================
-# STAGE: DOWNLOAD COMPLETIONS to local machine
-# =============================================================================
-
-@app.function(
-    image=image,
-    secrets=[secret],
-    volumes={VOLUME_MOUNT: volume},
-    timeout=60 * 5,
-)
-def stage_read_completions() -> bytes:
-    """Return completions file contents so the local entrypoint can save it."""
-    path = os.path.join(BASE_DIR, "part3_completions.jsonl")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Completions not found at {path}. Run stage_collect_completions first.")
-    with open(path, "rb") as f:
-        return f.read()
+    print(f"\nKarpathy after RL (pass@1 greedy): 7.58%")
+    print(f"Our SFT baseline (pass@1 greedy) : 20.0%")
 
 
 # =============================================================================
@@ -292,40 +224,20 @@ def main() -> None:
     print("\n" + "=" * w)
     print("Part 3: RL on GSM8K — Replication Run")
     print(f"  SFT starting point : {SFT_TAG} (20% GSM8K from Part 2)")
-    print(f"  RL output tag      : {RL_TAG}")
     print(f"  GPU                : {GPU_TRAIN}")
-    print(f"  WandB              : {WANDB_PROJECT}")
+    print(f"  W&B run            : {WANDB_PROJECT}_rl_baseline  (project: nanochat-rl)")
     print("=" * w + "\n")
 
-    print("[1/4] RL training...")
+    print("[1/2] RL training...")
     stage_rl_baseline.remote()
 
-    print("[2/4] Collecting completions for error analysis...")
+    print("[2/2] Eval + collecting completions...")
     stage_collect_completions.remote()
 
-    print("[3/4] Final eval (pass@1 greedy, pass@1 sampled, pass@8)...")
-    eval_results = stage_eval.remote()
-
-    print("[4/4] Downloading completions locally...")
-    data = stage_read_completions.remote()
-    local_path = "dev/part3_completions.jsonl"
-    with open(local_path, "wb") as f:
-        f.write(data)
-    print(f"Completions saved locally to: {local_path}")
-
     print("\n" + "=" * w)
-    print("FINAL COMPARISON — Our Run vs Karpathy (discussion #1)")
-    print("=" * w)
-    print(f"  Karpathy after SFT (pass@1 greedy) : {KARPATHY_RESULTS['after_sft']:.1%}")
-    print(f"  Ours     after SFT (pass@1 greedy) : {OUR_SFT_RESULT:.1%}  (+{OUR_SFT_RESULT - KARPATHY_RESULTS['after_sft']:.1%} vs Karpathy SFT)")
-    print(f"  Karpathy after RL  (pass@1 greedy) : {KARPATHY_RESULTS['after_rl']:.1%}")
-    if eval_results:
-        our_rl = eval_results['pass@1_greedy']
-        print(f"  Ours     after RL  (pass@1 greedy) : {our_rl:.1%}  (+{our_rl - KARPATHY_RESULTS['after_rl']:.1%} vs Karpathy RL)")
-        print(f"  Ours     after RL  (pass@1 sampled): {eval_results['pass@1_sampled']:.1%}")
-        print(f"  Ours     after RL  (pass@8 sampled): {eval_results['pass@8']:.1%}")
-    print("=" * w)
-    print(f"\nCompletions : {local_path}")
-    print("Run analysis: python dev/part3_analysis.py")
-    print("W&B project : nanochat-part3  (reward + pass@k curves during training)")
+    print("Part 3 complete!")
+    print("Download completions:")
+    print("  modal volume get nanochat-vol nanochat_cache/part3_completions.jsonl dev/part3_completions.jsonl")
+    print("Run analysis:")
+    print("  python dev/part3_analysis.py")
     print("=" * w + "\n")
