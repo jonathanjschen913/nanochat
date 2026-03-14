@@ -67,6 +67,11 @@ parser.add_argument("--chatcore-max-sample", type=int, default=24, help="max pro
 # Data mixture
 parser.add_argument("--mmlu-epochs", type=int, default=3, help="number of epochs of MMLU in training mixture (teaches Multiple Choice)")
 parser.add_argument("--gsm8k-epochs", type=int, default=4, help="number of epochs of GSM8K in training mixture (teaches Math and Tool Use)")
+# Additional math datasets (Part 2 experiments)
+parser.add_argument("--metamathqa", action="store_true", help="include MetaMathQA (395K) in training mixture")
+parser.add_argument("--orcamath", action="store_true", help="include Orca-Math (200K) in training mixture")
+parser.add_argument("--dartmath", action="store_true", help="include DART-Math-Hard (585K) in training mixture")
+parser.add_argument("--sft-tag", type=str, default=None, help="override output checkpoint dirname (default: model-tag or d{depth})")
 args = parser.parse_args()
 user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
@@ -167,6 +172,19 @@ train_tasks = [
     SimpleSpelling(size=200000, split="train"), # 200K rows of Simple Spelling (e.g. spell the word 'apple')
     SpellingBee(size=80000, split="train"), # 80K rows of Spelling Bee (e.g. how many 'r' are in 'strawberry'?)
 ]
+# Conditionally add math datasets (Part 2 experiments)
+if args.metamathqa:
+    from tasks.metamathqa import MetaMathQA
+    train_tasks.append(MetaMathQA(split="train"))
+    print0("Added MetaMathQA (395K rows) to training mixture")
+if args.orcamath:
+    from tasks.orcamath import OrcaMath
+    train_tasks.append(OrcaMath(split="train"))
+    print0("Added Orca-Math (200K rows) to training mixture")
+if args.dartmath:
+    from tasks.dartmath import DARTMath
+    train_tasks.append(DARTMath(split="train"))
+    print0("Added DART-Math-Hard (585K rows) to training mixture")
 train_dataset = TaskMixture(train_tasks)
 print0(f"Training mixture: {len(train_dataset):,} rows (MMLU x{args.mmlu_epochs}, GSM8K x{args.gsm8k_epochs})")
 val_dataset = TaskMixture([
@@ -383,7 +401,7 @@ while True:
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
-        output_dirname = args.model_tag if args.model_tag else f"d{depth}" # e.g. d12
+        output_dirname = args.sft_tag if args.sft_tag else (args.model_tag if args.model_tag else f"d{depth}") # e.g. sft_baseline
         checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", output_dirname)
         save_checkpoint(
             checkpoint_dir,

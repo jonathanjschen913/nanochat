@@ -17,7 +17,7 @@ import torch.distributed as dist
 
 from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
 from nanochat.checkpoint_manager import load_model
-from nanochat.engine import Engine
+from nanochat.engine import Engine, sample_next_token, use_calculator
 
 from tasks.humaneval import HumanEval
 from tasks.mmlu import MMLU
@@ -26,12 +26,100 @@ from tasks.gsm8k import GSM8K
 from tasks.spellingbee import SpellingBee
 
 # -----------------------------------------------------------------------------
+# Cache-free generation for models that don't support KV cache (e.g. differential attention)
+
+@torch.inference_mode()
+def generate_batch_no_cache(model, tokenizer, tokens, num_samples=1, max_tokens=512, temperature=0.0, top_k=50, seed=42):
+    """
+    Generate completions without KV cache — full-sequence forward pass per token.
+    Same interface as Engine.generate_batch(): returns (results, masks).
+    Supports tool use (calculator) via python_start/python_end detection.
+    """
+    from collections import deque
+    device = model.get_device()
+    rng = torch.Generator(device=device)
+    rng.manual_seed(seed)
+
+    # Special tokens
+    get_special = lambda s: tokenizer.encode_special(s)
+    python_start = get_special("<|python_start|>")
+    python_end = get_special("<|python_end|>")
+    output_start = get_special("<|output_start|>")
+    output_end = get_special("<|output_end|>")
+    assistant_end = get_special("<|assistant_end|>")
+    bos = tokenizer.get_bos_token_id()
+
+    # Initialize per-sample state
+    seqs = [list(tokens) for _ in range(num_samples)]
+    masks = [[0] * len(tokens) for _ in range(num_samples)]
+    completed = [False] * num_samples
+    forced_queues = [deque() for _ in range(num_samples)]
+    in_python = [False] * num_samples
+    python_expr = [[] for _ in range(num_samples)]
+
+    for _ in range(max_tokens):
+        if all(completed):
+            break
+
+        # Build batch of current sequences (may differ in length due to tool use)
+        # Process each sample independently since lengths may differ
+        for i in range(num_samples):
+            if completed[i]:
+                continue
+
+            # Check if we have forced tokens
+            if forced_queues[i]:
+                next_token = forced_queues[i].popleft()
+                is_forced = True
+            else:
+                # Forward pass for this sample
+                ids = torch.tensor([seqs[i]], dtype=torch.long, device=device)
+                logits = model(ids, kv_cache=None)
+                logits = logits[:, -1, :]  # (1, vocab_size)
+                next_ids = sample_next_token(logits, rng, temperature, top_k)
+                next_token = next_ids[0, 0].item()
+                is_forced = False
+
+            # Check for stop tokens
+            if next_token == assistant_end or next_token == bos:
+                completed[i] = True
+                continue
+
+            seqs[i].append(next_token)
+            masks[i].append(0 if is_forced else 1)
+
+            # Tool use state machine
+            if next_token == python_start:
+                in_python[i] = True
+                python_expr[i] = []
+            elif next_token == python_end and in_python[i]:
+                in_python[i] = False
+                if python_expr[i]:
+                    expr = tokenizer.decode(python_expr[i])
+                    result = use_calculator(expr)
+                    if result is not None:
+                        result_tokens = tokenizer.encode(str(result))
+                        forced_queues[i].append(output_start)
+                        forced_queues[i].extend(result_tokens)
+                        forced_queues[i].append(output_end)
+                python_expr[i] = []
+            elif in_python[i]:
+                python_expr[i].append(next_token)
+
+    return seqs, masks
+
+# -----------------------------------------------------------------------------
 # Generative evaluation loop (we go one problem at a time, sample, evaluate)
 
 def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_new_tokens, temperature, top_k, max_problems=None):
 
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
+
+    # Auto-detect differential attention — use cache-free generation if needed
+    use_no_cache = getattr(model.config, 'differential_attn', False)
+    if use_no_cache:
+        print0("Using cache-free generation (differential attention detected)")
 
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
@@ -43,13 +131,22 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
         # Get the completions
-        results, _ = engine.generate_batch(
-            encoded_prompt,
-            num_samples=num_samples,
-            max_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-        )
+        if use_no_cache:
+            results, _ = generate_batch_no_cache(
+                model, tokenizer, encoded_prompt,
+                num_samples=num_samples,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
+        else:
+            results, _ = engine.generate_batch(
+                encoded_prompt,
+                num_samples=num_samples,
+                max_tokens=max_new_tokens,
+                temperature=temperature,
+                top_k=top_k,
+            )
         # Decode the completions as text
         prefix_length = len(encoded_prompt)
         completions = [tokenizer.decode(result_tokens[prefix_length:]) for result_tokens in results]
