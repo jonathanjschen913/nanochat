@@ -115,7 +115,7 @@ def get_batch():
                     max_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     top_k=args.top_k,
-                    seed=seed, # must make sure to change the seed for each sampling step
+                    seed=seed,
                 )
             generated_token_sequences.extend(generated_token_sequences_batch)
             masks.extend(masks_batch)
@@ -178,7 +178,7 @@ def run_gsm8k_eval(task, tokenizer, engine,
             num_samples=num_samples,
             max_tokens=max_completion_tokens,
             temperature=temperature,
-            top_k=top_k
+            top_k=top_k,
         )
         # Check each sample for correctness
         outcomes = []
@@ -228,7 +228,7 @@ batch_iterator = get_batch()
 for step in range(num_steps):
 
     # Evaluate the model once in a while and log to wandb
-    if step % args.eval_every == 0:
+    if step % args.eval_every == 0 and step > 0:
         model.eval()
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         with autocast_ctx:

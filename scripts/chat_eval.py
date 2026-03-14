@@ -116,11 +116,6 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
     device = model.get_device()
 
-    # Auto-detect differential attention — use cache-free generation if needed
-    use_no_cache = getattr(model.config, 'differential_attn', False)
-    if use_no_cache:
-        print0("Using cache-free generation (differential attention detected)")
-
     num_problems = len(task_object) if max_problems is None else min(len(task_object), max_problems)
 
     # Run the evaluation
@@ -130,17 +125,8 @@ def run_generative_eval(task_object, tokenizer, model, engine, num_samples, max_
 
         # Tokenize the prompt
         encoded_prompt = tokenizer.render_for_completion(conversation)
-        # Get the completions
-        if use_no_cache:
-            results, _ = generate_batch_no_cache(
-                model, tokenizer, encoded_prompt,
-                num_samples=num_samples,
-                max_tokens=max_new_tokens,
-                temperature=temperature,
-                top_k=top_k,
-            )
-        else:
-            results, _ = engine.generate_batch(
+        # Get the completions — KV cache now works for diff_attn (nanochat/gpt.py)
+        results, _ = engine.generate_batch(
                 encoded_prompt,
                 num_samples=num_samples,
                 max_tokens=max_new_tokens,

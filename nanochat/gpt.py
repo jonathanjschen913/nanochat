@@ -110,9 +110,6 @@ class CausalSelfAttention(nn.Module):
         cos, sin = cos_sin
 
         if self.differential_attn:
-            if kv_cache is not None:
-                raise NotImplementedError("KV cache inference not supported for differential attention")
-
             # Split Q into q1, q2
             q_full = self.c_q(x).view(B, T, self.n_head, 2, self.head_dim)
             q1, q2 = q_full[..., 0, :], q_full[..., 1, :]  # (B, T, n_head, head_dim) each
@@ -145,14 +142,47 @@ class CausalSelfAttention(nn.Module):
                    - torch.dot(self.lambda_q2, self.lambda_k2).clamp(-10, 10).exp()
                    + self.lambda_init)
 
-            # Batch q1/q2 and k1/k2 into 2B so each v-half needs only one attention call.
-            # By linearity: attn(q,k,cat(v1,v2)) = cat(attn(q,k,v1), attn(q,k,v2))
-            q_cat = torch.cat([q1, q2], dim=0)   # (2B, T, n_head, head_dim)
-            k_cat = torch.cat([k1, k2], dim=0)   # (2B, T, n_kv_head, head_dim)
-            v1_rep = torch.cat([v1, v1], dim=0)  # (2B, T, n_kv_head, head_dim)
-            v2_rep = torch.cat([v2, v2], dim=0)  # (2B, T, n_kv_head, head_dim)
-            Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
-            Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+            if kv_cache is not None:
+                # KV cache inference for differential attention.
+                # The cache has 2*n_kv_head heads (== config.n_kv_head since self.n_kv_head is halved).
+                # We use the first n_kv_head slots for k1/v1 and the last n_kv_head slots for k2/v2.
+                k_cache_full, v_cache_full = kv_cache.get_layer_cache(self.layer_idx)
+                k1_cache = k_cache_full[:, :, :self.n_kv_head, :]  # (B, max_seq, n_kv_head, head_dim)
+                k2_cache = k_cache_full[:, :, self.n_kv_head:, :]
+                v1_cache = v_cache_full[:, :, :self.n_kv_head, :]
+                v2_cache = v_cache_full[:, :, self.n_kv_head:, :]
+                # Write new k1, k2, v1, v2 into their cache slots
+                pos = kv_cache.cache_seqlens[0].item()
+                k1_cache[:, pos:pos+T, :, :] = k1
+                k2_cache[:, pos:pos+T, :, :] = k2
+                v1_cache[:, pos:pos+T, :, :] = v1
+                v2_cache[:, pos:pos+T, :, :] = v2
+                # Attend over the full cached sequences
+                full_len = pos + T
+                k1_full = k1_cache[:, :full_len, :, :]
+                k2_full = k2_cache[:, :full_len, :, :]
+                v1_full = v1_cache[:, :full_len, :, :]
+                v2_full = v2_cache[:, :full_len, :, :]
+                # Advance position after last layer
+                if self.layer_idx == kv_cache.n_layers - 1:
+                    kv_cache.advance(T)
+                # Compute differential attention over cached sequences
+                q_cat = torch.cat([q1, q2], dim=0)
+                k_cat = torch.cat([k1_full, k2_full], dim=0)
+                v1_rep = torch.cat([v1_full, v1_full], dim=0)
+                v2_rep = torch.cat([v2_full, v2_full], dim=0)
+                Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
+                Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+            else:
+                # Batch q1/q2 and k1/k2 into 2B so each v-half needs only one attention call.
+                # By linearity: attn(q,k,cat(v1,v2)) = cat(attn(q,k,v1), attn(q,k,v2))
+                q_cat = torch.cat([q1, q2], dim=0)   # (2B, T, n_head, head_dim)
+                k_cat = torch.cat([k1, k2], dim=0)   # (2B, T, n_kv_head, head_dim)
+                v1_rep = torch.cat([v1, v1], dim=0)  # (2B, T, n_kv_head, head_dim)
+                v2_rep = torch.cat([v2, v2], dim=0)  # (2B, T, n_kv_head, head_dim)
+                Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
+                Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+
             # Split back and compute differential subtraction per v-half
             y = torch.cat([Ap1[:B] - lam * Ap1[B:], Ap2[:B] - lam * Ap2[B:]], dim=-1)  # (B, T, n_head, 2*head_dim)
 
