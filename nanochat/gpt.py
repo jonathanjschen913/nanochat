@@ -14,6 +14,7 @@ Notable features:
 
 from functools import partial
 from dataclasses import dataclass
+from math import exp
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,14 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (half context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    # Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)
+    # Two softmax maps whose difference cancels attention noise, focusing on relevant tokens
+    differential_attn: bool = False
+    # Mixture of Depths (Raposo et al., arXiv 2404.02258)
+    # Even-indexed layers route top mod_capacity fraction of tokens; odd layers are full-capacity.
+    # Incompatible with cla_sharing > 1. KV cache inference not supported.
+    mod_routing: bool = False
+    mod_capacity: float = 0.125  # top 12.5% of tokens pass through MoD layers (paper recommendation)
 
 
 def norm(x):
@@ -60,22 +69,101 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_kv_head
+        self.differential_attn = config.differential_attn
         self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
+        # For differential attention, each "super-head" uses two Q/K groups.
+        # We halve n_head/n_kv_head so total output dim stays n_embd (n_head * 2 * head_dim).
+        if config.differential_attn:
+            assert config.n_head % 2 == 0 and config.n_kv_head % 2 == 0, \
+                "n_head and n_kv_head must be even for differential attention"
+            self.n_head = config.n_head // 2
+            self.n_kv_head = config.n_kv_head // 2
+        else:
+            self.n_head = config.n_head
+            self.n_kv_head = config.n_kv_head
+        self.head_dim = config.n_embd // config.n_head  # always use original n_head for head_dim
+        assert self.n_embd % config.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+
+        if config.differential_attn:
+            # Two Q groups per super-head (always needed)
+            self.c_q = nn.Linear(self.n_embd, 2 * self.n_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, 2 * self.n_kv_head * self.head_dim, bias=False)
+            # Lambda scalars for differential weighting (learned, one per head_dim)
+            self.lambda_q1 = nn.Parameter(torch.zeros(self.head_dim))
+            self.lambda_k1 = nn.Parameter(torch.zeros(self.head_dim))
+            self.lambda_q2 = nn.Parameter(torch.zeros(self.head_dim))
+            self.lambda_k2 = nn.Parameter(torch.zeros(self.head_dim))
+            # Fixed init scalar (not learned): lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
+            self.lambda_init = 0.8 - 0.6 * exp(-0.3 * layer_idx)
+        else:
+            self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
+            self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+            self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
         self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
+        cos, sin = cos_sin
 
+        if self.differential_attn:
+            if kv_cache is not None:
+                raise NotImplementedError("KV cache inference not supported for differential attention")
+
+            # Split Q into q1, q2
+            q_full = self.c_q(x).view(B, T, self.n_head, 2, self.head_dim)
+            q1, q2 = q_full[..., 0, :], q_full[..., 1, :]  # (B, T, n_head, head_dim) each
+
+            k_full = self.c_k(x).view(B, T, self.n_kv_head, 2, self.head_dim)
+            k1, k2 = k_full[..., 0, :], k_full[..., 1, :]
+            # V is projected to 2*head_dim and split into v1, v2 (each head_dim).
+            # This avoids passing D_v != D_q to SDPA, which produces incorrect output
+            # shapes in torch.compile on MPS (MPS SDPA assumes D_out == D_q).
+            v_full = self.c_v(x).view(B, T, self.n_kv_head, 2, self.head_dim)
+            v1, v2 = v_full[..., 0, :], v_full[..., 1, :]  # (B, T, n_kv_head, head_dim) each
+
+            # Value embedding applied to v1 and v2 separately
+            if ve is not None:
+                ve_split = ve.view(B, T, self.n_kv_head, 2, self.head_dim)
+                gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))  # (B, T, n_kv_head)
+                v1 = v1 + gate.unsqueeze(-1) * ve_split[..., 0, :]
+                v2 = v2 + gate.unsqueeze(-1) * ve_split[..., 1, :]
+
+            # RoPE + QK-norm for all four groups.
+            # QK-norm is required for training stability with Muon: without it,
+            # Muon grows Q/K weight norms until q@k^T overflows in bfloat16.
+            q1, q2 = apply_rotary_emb(q1, cos, sin), apply_rotary_emb(q2, cos, sin)
+            k1, k2 = apply_rotary_emb(k1, cos, sin), apply_rotary_emb(k2, cos, sin)
+            q1, q2, k1, k2 = norm(q1), norm(q2), norm(k1), norm(k2)
+
+            # Differential lambda scalar: exp(lq1·lk1) - exp(lq2·lk2) + lambda_init
+            # Clamp dot products before exp to prevent bfloat16 overflow (exp(>10) = inf)
+            lam = (torch.dot(self.lambda_q1, self.lambda_k1).clamp(-10, 10).exp()
+                   - torch.dot(self.lambda_q2, self.lambda_k2).clamp(-10, 10).exp()
+                   + self.lambda_init)
+
+            # Batch q1/q2 and k1/k2 into 2B so each v-half needs only one attention call.
+            # By linearity: attn(q,k,cat(v1,v2)) = cat(attn(q,k,v1), attn(q,k,v2))
+            q_cat = torch.cat([q1, q2], dim=0)   # (2B, T, n_head, head_dim)
+            k_cat = torch.cat([k1, k2], dim=0)   # (2B, T, n_kv_head, head_dim)
+            v1_rep = torch.cat([v1, v1], dim=0)  # (2B, T, n_kv_head, head_dim)
+            v2_rep = torch.cat([v2, v2], dim=0)  # (2B, T, n_kv_head, head_dim)
+            Ap1 = flash_attn.flash_attn_func(q_cat, k_cat, v1_rep, causal=True, window_size=window_size)
+            Ap2 = flash_attn.flash_attn_func(q_cat, k_cat, v2_rep, causal=True, window_size=window_size)
+            # Split back and compute differential subtraction per v-half
+            y = torch.cat([Ap1[:B] - lam * Ap1[B:], Ap2[:B] - lam * Ap2[B:]], dim=-1)  # (B, T, n_head, 2*head_dim)
+
+            # Per-head RMSNorm scaled by (1 - lambda_init)
+            y = F.rms_norm(y, (2 * self.head_dim,)) * (1 - self.lambda_init)
+
+            y = y.contiguous().view(B, T, -1)  # (B, T, n_embd)
+            y = self.c_proj(y)
+            return y
+
+        # --- Standard (non-differential) path ---
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
@@ -89,7 +177,6 @@ class CausalSelfAttention(nn.Module):
             v = v + gate.unsqueeze(-1) * ve
 
         # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k) # QK norm
 
@@ -131,15 +218,79 @@ class MLP(nn.Module):
         return x
 
 
+class MoDRouter(nn.Module):
+    """Scalar router for Mixture of Depths. Projects n_embd -> 1 (no bias)."""
+    def __init__(self, n_embd: int):
+        super().__init__()
+        self.proj = nn.Linear(n_embd, 1, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)  # (B, T, 1)
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        # MoD router on even-indexed layers only
+        self.mod_router = (
+            MoDRouter(config.n_embd)
+            if config.mod_routing and layer_idx % 2 == 0
+            else None
+        )
+        self._mod_capacity_frac = config.mod_capacity
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
+        active_mlp = self.mlp
+
+        if self.mod_router is not None:
+            if kv_cache is not None:
+                raise NotImplementedError("KV cache inference not supported for MoD layers.")
+            B, T, D_embd = x.shape
+            capacity = max(1, int(self._mod_capacity_frac * T))
+
+            # 1. Router scores + top-k selection
+            router_weights = self.mod_router(x).squeeze(-1)          # (B, T)
+            _, top_indices = torch.topk(router_weights, capacity, dim=1)
+
+            # 2. Sort by original position for causal RoPE correctness
+            sorted_positions, _ = torch.sort(top_indices, dim=1)     # (B, capacity)
+
+            # 3. Gather selected tokens
+            gather_e = sorted_positions[:, :, None].expand(-1, -1, D_embd)
+            x_sel = x.gather(1, gather_e)                            # (B, capacity, D_embd)
+
+            # 4. Gather router weights at sorted positions
+            router_w_sel = router_weights.gather(1, sorted_positions).unsqueeze(-1)  # (B, capacity, 1)
+
+            # 5. Gather cos/sin at original positions
+            cos, sin = cos_sin
+            D2 = cos.size(-1)
+            gather_r = sorted_positions[:, :, None, None].expand(-1, -1, 1, D2)
+            cos_sel = cos.expand(B, -1, -1, -1).gather(1, gather_r)  # (B, capacity, 1, D2)
+            sin_sel = sin.expand(B, -1, -1, -1).gather(1, gather_r)
+
+            # 6. Gather value embeddings at selected positions (if present)
+            ve_sel = None
+            if ve is not None:
+                gather_v = sorted_positions[:, :, None].expand(-1, -1, ve.size(-1))
+                ve_sel = ve.gather(1, gather_v)
+
+            # 7. Run attention + MLP on compact tensor
+            x_out = x_sel + self.attn(norm(x_sel), ve_sel, (cos_sel, sin_sel),
+                                      window_size, kv_cache=None)
+            x_out = x_out + active_mlp(norm(x_out))
+
+            # 8. Weighted delta + scatter back
+            delta = x_out - x_sel
+            weighted_delta = router_w_sel * delta                    # (B, capacity, D_embd)
+            x = x.scatter_add(1, gather_e, weighted_delta)
+            return x
+
+        # --- Standard path (odd layers, or mod_routing=False) ---
         x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
-        x = x + self.mlp(norm(x))
+        x = x + active_mlp(norm(x))
         return x
 
 
@@ -229,6 +380,19 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
 
+        # MoD router: zero init so weighted_delta=0 at step 0 (MoD layers start as pure residuals)
+        for block in self.transformer.h:
+            if block.mod_router is not None:
+                torch.nn.init.zeros_(block.mod_router.proj.weight)
+
+        # Differential attention lambda vectors: small normal init (per paper)
+        if self.config.differential_attn:
+            for block in self.transformer.h:
+                torch.nn.init.normal_(block.attn.lambda_q1, mean=0, std=0.1)
+                torch.nn.init.normal_(block.attn.lambda_k1, mean=0, std=0.1)
+                torch.nn.init.normal_(block.attn.lambda_q2, mean=0, std=0.1)
+                torch.nn.init.normal_(block.attn.lambda_k2, mean=0, std=0.1)
+
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -309,9 +473,12 @@ class GPT(nn.Module):
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Sum attention FLOPs per layer, accounting for sliding window
         attn_flops = 0
-        for window_size in self.window_sizes:
+        for i, window_size in enumerate(self.window_sizes):
             window = window_size[0]  # (left, right) tuple, we use left
-            effective_seq = t if window < 0 else min(window, t)
+            if self.config.mod_routing and i % 2 == 0:
+                effective_seq = max(1, int(self.config.mod_capacity * t))
+            else:
+                effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
         return num_flops_per_token
@@ -350,13 +517,18 @@ class GPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
 
         # Separate out all parameters into groups
-        matrix_params = list(self.transformer.h.parameters())
+        # Lambda vectors (differential attn) are 1D — Muon requires 2D+, so split them out
+        all_h_params = list(self.transformer.h.parameters())
+        matrix_params = [p for p in all_h_params if p.ndim >= 2]
+        lambda_params = [p for p in all_h_params if p.ndim < 2]
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params)
+        assert (len(list(self.parameters())) ==
+                len(matrix_params) + len(lambda_params) + len(embedding_params) +
+                len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -371,6 +543,10 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
         ]
+        # Differential attention lambda vectors are 1D — add to AdamW (Muon requires 2D+).
+        # Use scalar_lr (not *0.01) since lambdas are the core learned mechanism of diff attn.
+        if lambda_params:
+            param_groups.append(dict(kind='adamw', params=lambda_params, lr=scalar_lr, betas=adam_betas, eps=1e-10, weight_decay=0.0))
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]

@@ -49,6 +49,14 @@ parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["ro
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
+parser.add_argument("--n-kv-heads", type=int, default=-1, help="number of KV heads for GQA (-1 = same as n_head, i.e. MHA)")
+parser.add_argument("--differential-attn", action="store_true", help="use Differential Attention (Microsoft Research, ICLR 2025, arXiv 2410.05258)")
+parser.add_argument("--mod-routing", action="store_true",
+    help="Mixture of Depths routing (Raposo et al., arXiv 2404.02258). "
+         "Even-indexed layers select top mod-capacity fraction of tokens; odd layers are full-capacity. "
+         "No KV cache inference support.")
+parser.add_argument("--mod-capacity", type=float, default=0.125,
+    help="fraction of tokens per MoD layer (default: 0.125 = 12.5%%, per paper)")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 # Training horizon (only one used, in order of precedence)
@@ -131,7 +139,9 @@ def build_model_meta(depth):
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+        n_layer=depth, n_head=num_heads, n_kv_head=args.n_kv_heads if args.n_kv_heads > 0 else num_heads, n_embd=model_dim,
+        differential_attn=args.differential_attn,
+        mod_routing=args.mod_routing, mod_capacity=args.mod_capacity,
         window_pattern=args.window_pattern,
     )
     with torch.device("meta"):
